@@ -45,10 +45,10 @@ step() { echo "==> $*"; }
 step "enabling APIs"
 $G services enable compute.googleapis.com secretmanager.googleapis.com storage.googleapis.com iam.googleapis.com
 
-SA="qt-vm@${PROJECT}.iam.gserviceaccount.com"
+SA="qt-vm-runner@${PROJECT}.iam.gserviceaccount.com"
 step "VM service account"
 $G iam service-accounts describe "$SA" >/dev/null 2>&1 || \
-  $G iam service-accounts create qt-vm --display-name "quant-trader VM (reads its secret and bucket only)"
+  $G iam service-accounts create qt-vm-runner --display-name "quant-trader VM (reads its secret and bucket only)"
 
 step "bucket gs://$BUCKET"
 $G storage buckets describe "gs://$BUCKET" >/dev/null 2>&1 || \
