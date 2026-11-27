@@ -4,7 +4,7 @@
 # The report holds container states, health endpoints, resources and recent log lines; never .env contents.
 set -uo pipefail
 APP=/opt/quant-trader
-BUCKET=gs://__BUCKET__
+BUCKET="gs://$(cat /etc/qt-bucket 2>/dev/null)"
 cd "$APP/repo" || exit 0
 DOMAIN=$(grep -E '^DASHBOARD_DOMAIN=' "$APP/.env" | cut -d= -f2-)
 OUT=$(mktemp)
@@ -14,7 +14,7 @@ OUT=$(mktemp)
   echo "uptime: $(uptime -p)"
   echo "dashboard: https://$DOMAIN"
   echo "--- containers"
-  docker compose ps --format '{{.Service}} {{.State}} {{.Health}} {{.Status}}'
+  docker compose ps -a --format '{{.Name}} {{.State}} {{.Health}} {{.Status}}'
   echo "--- api /api/health (local)"
   curl -s -m 10 http://127.0.0.1:8080/api/health; echo
   echo "--- dashboard over public HTTPS"
@@ -25,6 +25,8 @@ OUT=$(mktemp)
   timedatectl show -p NTPSynchronized --value | sed 's/^/ntp_synchronized=/'
   echo "--- engine log (last 60 lines)"
   docker compose logs --no-color --tail 60 engine 2>&1 | sed -E 's/(key|secret|token|password)[^ ]*=[^ ]+/\1=<redacted>/Ig'
+  echo "--- api log (last 20 lines)"
+  docker compose logs --no-color --tail 20 api 2>&1 | sed -E 's/(key|secret|token|password)[^ ]*=[^ ]+/\1=<redacted>/Ig'
   echo "--- research log (last 30 lines)"
   docker compose logs --no-color --tail 30 research 2>&1 | sed -E 's/(key|secret|token|password)[^ ]*=[^ ]+/\1=<redacted>/Ig'
 } > "$OUT" 2>&1

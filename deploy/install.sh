@@ -50,5 +50,8 @@ else
 fi
 
 cd "$APP/repo"
-docker compose up -d --build
+# containers left renamed ("<id>_repo-api-1") by an interrupted recreate block the real name; clear them
+docker ps -a --format '{{.ID}} {{.Names}}' | awk '$2 ~ /^[0-9a-f]+_repo-/ {print $1}' | xargs -r docker rm -f
+docker compose up -d --build --remove-orphans
+docker compose up -d   # second pass starts anything a failed recreate left stopped
 docker compose ps

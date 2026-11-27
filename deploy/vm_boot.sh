@@ -45,7 +45,7 @@ echo "$REL" > "$APP/release.txt"
 
 # health reporter + self-update timer
 install -m 755 "$APP/repo/deploy/vm_health.sh" /usr/local/bin/qt-health
-sed -i "s|__BUCKET__|${BUCKET#gs://}|g" /usr/local/bin/qt-health
+echo "${BUCKET#gs://}" > /etc/qt-bucket   # (a sed placeholder here was itself replaced by gcp_deploy.sh)
 cat > /etc/systemd/system/qt-health.service <<EOF
 [Unit]
 Description=quant-trader health report and release check
