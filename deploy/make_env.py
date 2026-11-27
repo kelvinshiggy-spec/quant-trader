@@ -37,6 +37,7 @@ def build(env: dict, overnight: bool, auto_approve: bool, experimental: str = ""
         "AUTO_APPROVE_VALIDATED": "true" if auto_approve else "false",
         "EXPERIMENTAL_STRATEGIES": experimental,   # owner-approved, unvalidated, paper only
         "MIN_DAILY_TRADES": str(min_daily_trades),  # paper only; ignored in live mode
+        "SWING_WIDE_UNIVERSE": env.get("SWING_WIDE_UNIVERSE", "0"),
         "DASHBOARD_DOMAIN": "auto",  # replaced on the server with <ip-with-dashes>.sslip.io
         "DASHBOARD_USER": env.get("DASHBOARD_USER", "admin"),
         "DASHBOARD_PASSWORD_HASH": bcrypt.hashpw(pw.encode(), bcrypt.gensalt(12)).decode(),
