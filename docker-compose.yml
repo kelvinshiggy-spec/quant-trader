@@ -21,9 +21,9 @@ services:
     healthcheck:
       test: ["CMD", "python", "-m", "qt.healthcheck", "engine"]
       interval: 60s
-      timeout: 10s
-      retries: 3
-      start_period: 180s
+      timeout: 30s
+      retries: 5
+      start_period: 600s
 
   api:
     <<: *common
@@ -33,9 +33,9 @@ services:
     healthcheck:
       test: ["CMD", "python", "-m", "qt.healthcheck", "api"]
       interval: 60s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
+      timeout: 30s
+      retries: 5
+      start_period: 300s
 
   research:
     <<: *common
@@ -47,9 +47,9 @@ services:
     healthcheck:
       test: ["CMD", "python", "-m", "qt.healthcheck", "research"]
       interval: 300s
-      timeout: 10s
+      timeout: 30s
       retries: 3
-      start_period: 600s
+      start_period: 900s
 
   caddy:
     image: caddy:2.8.4
