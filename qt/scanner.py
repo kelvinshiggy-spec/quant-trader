@@ -15,6 +15,7 @@ within the IEX feed, and IEX spreads are shown as "IEX quote spread".
 from __future__ import annotations
 
 import datetime as dt
+import re
 import logging
 import math
 
@@ -123,3 +124,17 @@ def correlation_with(returns: pd.DataFrame, sym: str, held: list[str]) -> float:
     vals = [returns[sym].corr(returns[h]) for h in held if h in returns and h != sym]
     vals = [v for v in vals if v == v]
     return float(max(vals)) if vals else 0.0
+
+
+# leveraged / inverse / volatility products (owner: forced daily trades must skip them, 2026-11-27)
+_LEVERAGED_NAME = re.compile(r"(\b\d+(\.\d+)?x\b|ultra|\bshort\b|\binverse\b|\bbear\b|\bbull\b|daily target|"
+                             r"leveraged|\bvix\b|volatility|-1x)", re.I)
+_LEVERAGED_SYMBOLS = {"TQQQ", "SQQQ", "SOXL", "SOXS", "TSLL", "TSLQ", "TSLZ", "NVDL", "NVDU", "NVDD", "SPXL", "SPXS",
+                      "SPXU", "UPRO", "SDS", "SSO", "SH", "QID", "QLD", "PSQ", "TNA", "TZA", "LABU", "LABD", "FAS", "FAZ",
+                      "NUGT", "DUST", "JNUG", "JDST", "YINN", "YANG", "UVXY", "SVXY", "VXX", "VIXY", "BITX", "MSTU", "MSTX",
+                      "MSTZ", "CONL", "UCO", "SCO", "BOIL", "KOLD", "TECL", "TECS", "FNGU", "FNGD", "DPST", "UDOW", "SDOW",
+                      "TMF", "TMV", "TBT", "UBT", "ERX", "ERY", "GUSH", "DRIP", "AMDL", "AAPU", "METU", "GGLL", "AMZU"}
+
+
+def is_leveraged_or_inverse(symbol: str, name: str = "") -> bool:
+    return symbol.upper() in _LEVERAGED_SYMBOLS or bool(_LEVERAGED_NAME.search(name or ""))

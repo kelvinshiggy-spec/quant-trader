@@ -36,7 +36,7 @@ from .markettime import ET, PT, fmt_pt, now_utc, pt_schedule_for, session
 from .notify import Notifier
 from .regime import coarse, daily_regimes, describe_current
 from .reporting import build_report, render_text, save_report, to_csv
-from .scanner import build_discovery_universe, choose_watchlist, correlation_with, default_universe, stage1_rank
+from .scanner import build_discovery_universe, choose_watchlist, correlation_with, default_universe, stage1_rank, is_leveraged_or_inverse
 from .scoring import Opportunity, classify, score
 from .strategies.features import intraday_features
 from .strategies.library import BY_NAME
@@ -515,6 +515,9 @@ class Engine:
                 continue
             asset = self.broker.get_asset(o.symbol)
             if not asset.get("tradable") or not asset.get("fractionable"):
+                continue
+            if is_leveraged_or_inverse(o.symbol, asset.get("name", "")):
+                log.info("forced trade candidate %s skipped: leveraged/inverse fund", o.symbol)
                 continue
             q = self.broker.latest_quotes([o.symbol]).get(o.symbol, {})
             tid = now.strftime("%Y%m%d%H%M%S") + uuid.uuid4().hex[:6]

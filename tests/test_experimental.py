@@ -94,3 +94,22 @@ def test_forced_trade_falls_back_to_scanner(tmp_path, monkeypatch):
     e.force_daily_minimum([], now, now - dt.timedelta(hours=2))
     tr = db.one("SELECT * FROM trades")
     assert tr and tr["symbol"] == "QQQ" and tr["strategy"] == "FORCED_daily_min"
+
+
+def test_forced_trade_skips_leveraged_funds(tmp_path, monkeypatch):
+    e, db = make(tmp_path, monkeypatch, status="rejected", MIN_DAILY_TRADES="1")
+    e.startup()
+    e.cycle()
+    now = e.clock()
+    bars = e.bars["SPY"]
+    for sym in ("TQQQ", "QQQ"):
+        e.bars[sym] = bars
+        e.prices[sym] = float(bars["close"].iloc[-1])
+        e.quote_ts[sym] = now
+        e.spreads[sym] = 2.0
+        e.broker.prices[sym] = e.prices[sym]
+    db.kv_set("stage1", {"top": [{"symbol": "TQQQ", "from_open_pct": 2.0, "stage1_score": 5.0, "adv": 1e10},
+                                 {"symbol": "QQQ", "from_open_pct": 0.8, "stage1_score": 3.1, "adv": 1e10}]})
+    e.force_daily_minimum([], now, now - dt.timedelta(hours=2))
+    tr = db.one("SELECT * FROM trades")
+    assert tr and tr["symbol"] == "QQQ"

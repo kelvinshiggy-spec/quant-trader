@@ -169,7 +169,7 @@ class AlpacaBroker(Broker):
             a = self.trading.get_asset(symbol)
         except Exception as e:  # noqa: BLE001
             raise _classify(e) from e
-        d = {"symbol": a.symbol, "tradable": bool(a.tradable), "fractionable": bool(a.fractionable),
+        d = {"symbol": a.symbol, "name": getattr(a, "name", "") or "", "tradable": bool(a.tradable), "fractionable": bool(a.fractionable),
              "status": getattr(a.status, "value", str(a.status)), "exchange": getattr(a.exchange, "value", str(a.exchange)),
              "asset_class": getattr(a.asset_class, "value", str(a.asset_class)), "shortable": bool(a.shortable),
              "min_order_size": float(a.min_order_size) if getattr(a, "min_order_size", None) else None,
