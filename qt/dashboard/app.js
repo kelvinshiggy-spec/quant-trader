@@ -23,7 +23,9 @@ $("#loginForm").addEventListener("submit", async (e) => {
   try {
     await api("/api/login", {method: "POST", body: JSON.stringify({username: $("#u").value, password: $("#p").value})});
     $("#p").value = ""; showApp(); refresh();
-  } catch (err) { $("#loginErr").textContent = err.message; }
+  } catch (err) {
+    $("#loginErr").textContent = err.message === "auth" ? "Wrong username or password (after 8 tries, wait 15 minutes)" : err.message;
+  }
 });
 
 document.querySelectorAll("#tabs button").forEach((b) => b.addEventListener("click", () => {

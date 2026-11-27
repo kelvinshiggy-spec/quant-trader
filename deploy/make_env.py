@@ -33,6 +33,12 @@ def build(env: dict, overnight: bool, auto_approve: bool, experimental: str = ""
         raise SystemExit(f"missing environment variables: {', '.join(missing)}")
     if len(pw) < 10:
         raise SystemExit("DASHBOARD_PASSWORD must be at least 10 characters")
+    # keep the session key and password hash of the running server when nothing changed, so a redeploy does
+    # not sign the owner out of the dashboard (PREVIOUS_ENV_FILE: the .env currently in Secret Manager)
+    prev = {}
+    if env.get("PREVIOUS_ENV_FILE") and os.path.exists(env["PREVIOUS_ENV_FILE"]):
+        prev = dict(x.split("=", 1) for x in open(env["PREVIOUS_ENV_FILE"]).read().splitlines() if "=" in x)
+    prev_hash = prev.get("DASHBOARD_PASSWORD_HASH", "").strip("'")
     lines = {
         "TRADING_MODE": "paper",
         "ALPACA_PAPER_API_KEY": key,
@@ -51,8 +57,9 @@ def build(env: dict, overnight: bool, auto_approve: bool, experimental: str = ""
         "QT_RISK_CEILING_JSON": _ceiling(env),
         "DASHBOARD_DOMAIN": "auto",  # replaced on the server with <ip-with-dashes>.sslip.io
         "DASHBOARD_USER": env.get("DASHBOARD_USER", "admin"),
-        "DASHBOARD_PASSWORD_HASH": bcrypt.hashpw(pw.encode(), bcrypt.gensalt(12)).decode(),
-        "SESSION_SECRET": secrets.token_hex(32),
+        "DASHBOARD_PASSWORD_HASH": (prev_hash if prev_hash and bcrypt.checkpw(pw.encode(), prev_hash.encode())
+                                    else bcrypt.hashpw(pw.encode(), bcrypt.gensalt(12)).decode()),
+        "SESSION_SECRET": prev.get("SESSION_SECRET") or secrets.token_hex(32),
         "NOTIFY_LEVEL": env.get("NOTIFY_LEVEL", "important"),
         "TELEGRAM_BOT_TOKEN": env.get("TELEGRAM_BOT_TOKEN", ""),
         "TELEGRAM_CHAT_ID": env.get("TELEGRAM_CHAT_ID", ""),
