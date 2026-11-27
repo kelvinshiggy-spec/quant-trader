@@ -29,6 +29,7 @@ OUT=$(mktemp)
   docker compose logs --no-color --tail 30 research 2>&1 | sed -E 's/(key|secret|token|password)[^ ]*=[^ ]+/\1=<redacted>/Ig'
 } > "$OUT" 2>&1
 gcloud storage cp "$OUT" "$BUCKET/status/health.txt" >/dev/null || echo "qt-health: upload to $BUCKET failed" >&2
+cat "$OUT"   # also to stdout: journal, and Cloud Logging when run from the boot script
 rm -f "$OUT"
 
 # self-update: a new release pointer -> re-run the boot script (idempotent; the engine reconciles on restart)

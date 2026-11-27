@@ -34,7 +34,13 @@ if [ ! -d "$APP/data/cache" ] && gcloud storage objects describe "$BUCKET/seed/c
   gcloud storage cp "$BUCKET/seed/cache.tar" "$APP/cache.tar" && tar -xf "$APP/cache.tar" -C "$APP/data" && rm -f "$APP/cache.tar"
 fi
 
-APP_DIR="$APP" DATA_DIR="$APP/data" SRC_DIR="$APP/repo" bash "$APP/repo/deploy/install.sh"
+# a container stuck in the kernel can make "compose up" fail; restart Docker once and retry instead of aborting
+# (aborting would skip the health timer below and leave the server unobservable)
+if ! APP_DIR="$APP" DATA_DIR="$APP/data" SRC_DIR="$APP/repo" bash "$APP/repo/deploy/install.sh"; then
+  echo "install failed; restarting docker and retrying once"
+  systemctl restart docker || true; sleep 15
+  APP_DIR="$APP" DATA_DIR="$APP/data" SRC_DIR="$APP/repo" bash "$APP/repo/deploy/install.sh" || echo "install failed twice"
+fi
 echo "$REL" > "$APP/release.txt"
 
 # health reporter + self-update timer
@@ -59,3 +65,5 @@ WantedBy=timers.target
 EOF
 systemctl daemon-reload
 systemctl enable --now qt-health.timer
+# first report right away; its text also lands in this script's output (Cloud Logging) for remote diagnosis
+/usr/local/bin/qt-health || true
