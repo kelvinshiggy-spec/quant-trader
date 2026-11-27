@@ -709,8 +709,25 @@ class Engine:
 
     # ---------------------------------------------------------------- run
     def startup(self) -> None:
+        # a slow first start (small server, empty caches) must not look dead to the container health check,
+        # or autoheal restarts the engine before it ever reaches the trading loop
+        done = threading.Event()
+
+        def beat():
+            while not done.wait(30):
+                self.db.heartbeat("engine", "starting", {"version": VERSION, "mode": self.s.mode})
+        self.db.heartbeat("engine", "starting", {"version": VERSION, "mode": self.s.mode})
+        threading.Thread(target=beat, name="startup-heartbeat", daemon=True).start()
+        try:
+            self._startup()
+        finally:
+            done.set()
+
+    def _startup(self) -> None:
+        log.info("engine %s starting in %s mode; reconciling with the broker", VERSION, self.s.mode)
         self.db.event("info", "startup", f"engine {VERSION} starting in {self.s.mode.upper()} mode; reconciling first")
         self.reconcile()
+        log.info("reconciliation done; integrity issues: %s", self.integrity or "none")
         self.last_recon = time.monotonic()
         if self.integrity:
             self.db.event("warning", "startup", "integrity issues at startup; entries blocked until resolved",
@@ -724,7 +741,9 @@ class Engine:
                 self.tm.request_exit(t, "stale_intraday_position")
         if not self.universe or self.db.kv_get("universe_date") != today:
             try:
+                log.info("building discovery universe")
                 self.universe = build_discovery_universe(self.broker, self.hist)
+                log.info("discovery universe: %d symbols", len(self.universe))
                 self.db.kv_set("discovery_universe", self.universe)
                 self.db.kv_set("universe_date", today)
             except Exception as e:  # noqa: BLE001

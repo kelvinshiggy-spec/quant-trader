@@ -19,6 +19,17 @@ OUT=$(mktemp)
   curl -s -m 10 http://127.0.0.1:8080/api/health; echo
   echo "--- dashboard over public HTTPS"
   curl -s -m 15 -o /dev/null -w 'http=%{http_code} tls_verify=%{ssl_verify_result}\n' "https://$DOMAIN/api/health"
+  echo "--- heartbeats and recent events (database)"
+  docker compose exec -T api python - <<'PY' 2>&1 | tail -40
+import sqlite3
+c = sqlite3.connect("file:/app/data/qt.db?mode=ro", uri=True, timeout=5)
+for r in c.execute("SELECT component, ts, status FROM heartbeats"):
+    print("hb", *r)
+for r in c.execute("SELECT ts, level, kind, substr(message, 1, 200) FROM events ORDER BY rowid DESC LIMIT 20"):
+    print("ev", *r)
+PY
+  echo "--- container resources"
+  docker stats --no-stream --format '{{.Name}} cpu={{.CPUPerc}} mem={{.MemUsage}}'
   echo "--- resources"
   free -m | head -3; df -h / | tail -1
   echo "--- clock"
