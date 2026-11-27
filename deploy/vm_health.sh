@@ -10,6 +10,8 @@ DOMAIN=$(grep -E '^DASHBOARD_DOMAIN=' "$APP/.env" | cut -d= -f2-)
 OUT=$(mktemp)
 # dashboard self-test: signs in like a browser and loads every tab's data; a failure means a blank/broken tab.
 # On failure the api container is restarted once and the test repeated; failures are logged as events.
+# right after a deploy the api is still starting: give it up to 2 minutes before testing (no false alarm)
+for _ in $(seq 1 24); do curl -s -m 5 -o /dev/null http://127.0.0.1:8080/api/health && break; sleep 5; done
 SELFTEST=$(docker compose exec -T api python -m qt.api.selftest --record 2>&1)
 if ! echo "$SELFTEST" | grep -q "dashboard_selftest: OK"; then
   docker compose restart api >/dev/null 2>&1 || true
