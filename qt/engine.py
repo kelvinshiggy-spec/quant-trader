@@ -245,7 +245,9 @@ class Engine:
             self.bars[s] = self.bars[s].iloc[-6000:]
 
     # ----------------------------------------------------------- strategies
-    def active_strategies(self) -> tuple[list[dict], list[dict]]:
+    def active_strategies(self, timeframe: str = "5Min") -> tuple[list[dict], list[dict]]:
+        """(active, shadow). Daily (overnight) strategies can only be ACTIVE when ALLOW_OVERNIGHT_HOLDS
+        is set by the owner; hourly crypto needs ALLOW_CRYPTO_EXECUTION and is not wired to execution yet."""
         rows = self.db.query("SELECT * FROM strategy_status")
         active, shadow = [], []
         for r in rows:
@@ -254,16 +256,93 @@ class Engine:
             if cls is None:
                 continue
             inst = cls(params=json.loads(r["params"] or "{}"))
-            if inst.timeframe != "5Min":
-                continue  # daily / crypto execution requires separate approval (overnight / 24-7)
+            if inst.timeframe != timeframe:
+                continue
             r["_inst"] = inst
             r["_oos"] = json.loads(r["oos_metrics"] or "{}")
             r["_allowed"] = set(json.loads(r["allowed_regimes"])) if r["allowed_regimes"] else None
-            if r["status"] == "validated" and r["approved"]:
+            executable = inst.timeframe == "5Min" or (inst.timeframe == "1Day" and self.s.allow_overnight)
+            if r["status"] == "validated" and r["approved"] and executable:
                 active.append(r)
             elif r["status"] in ("validated", "shadow"):
+                if r["status"] == "validated" and r["approved"] and not executable:
+                    r = dict(r, approved=0)  # approved, but overnight execution is switched off
                 shadow.append(r)
         return active, shadow
+
+    def daily_cycle(self, now: dt.datetime) -> None:
+        """Once per session shortly after the open: daily (swing) strategies on CONFIRMED daily bars
+        through yesterday; entries execute at today's open like the backtest; daily exits/trails."""
+        from .strategies.features import daily_features
+        from .universe import DAILY_UNIVERSE, SECTOR_ETFS
+        today = now.astimezone(ET).date()
+        if self.db.kv_get("daily_cycle_done") == today.isoformat():
+            return
+        active, shadow = self.active_strategies("1Day")
+        missing = [x for x in DAILY_UNIVERSE if x not in self.daily]
+        if missing:
+            try:
+                self.daily.update(self.hist._fetch(missing, "1Day", today - dt.timedelta(days=420),
+                                                   today - dt.timedelta(days=1), "us_equity", "sip"))
+            except Exception as e:  # noqa: BLE001
+                log.warning("daily universe fetch failed: %s", e)
+        feats = {s: daily_features(d) for s, d in self.daily.items() if s in DAILY_UNIVERSE and len(d) > 210}
+        rets = pd.DataFrame({s: feats[s]["ret63"] for s in SECTOR_ETFS if s in feats})
+        ranks = rets.rank(axis=1, ascending=False)
+        for s in rets.columns:
+            feats[s]["sector_rank"] = ranks[s]
+        regime_label = describe_current(self.regimes, today)["label"] if self.regimes is not None else "unknown"
+        reg_c = coarse(regime_label)
+        held = {t["symbol"]: t for t in self.tm.active_trades()}
+        opps = []
+        for r in active + shadow:
+            inst = r["_inst"]
+            for sym, f in feats.items():
+                if inst.name == "K_sector_rotation" and sym not in SECTOR_ETFS:
+                    continue
+                if f.index[-1].astimezone(ET).date() >= today:
+                    f = f[f.index.tz_convert(ET).date < today]  # confirmed bars only
+                sig = inst.signals(f).iloc[-1]
+                last = f.iloc[-1]
+                t = held.get(sym)
+                if t and t["strategy"] == r["strategy"]:
+                    ep = inst.exit_plan()
+                    entry = t["entry_price"] or last["close"]
+                    R = max(entry - (t["initial_stop"] or entry * 0.97), 1e-9)
+                    if bool(sig["exit_sig"]):
+                        self.tm.request_exit(t, "thesis_invalidated")
+                        continue
+                    held_days = len(pd.bdate_range(t["session"], today)) - 1 if t["session"] else 0
+                    if ep.max_bars and held_days >= ep.max_bars:
+                        self.tm.request_exit(t, "time_exit")
+                        continue
+                    if ep.trail_atr and last["close"] - entry >= ep.trail_activate_r * R:
+                        self.tm.move_stop(t, float(last["close"] - ep.trail_atr * last["atr"]), "trail")
+                    continue
+                if not bool(sig["entry"]):
+                    continue
+                adv = float(last.get("dollar_vol20") or 0) or None
+                o = Opportunity(symbol=sym, strategy=r["strategy"], price=float(self.prices.get(sym, last["close"])),
+                                change_pct=0.0, relvol=None, momentum=float(last.get("ret63", 0) * 100), regime=regime_label,
+                                stop=float(sig["stop"]), target=float(sig["target"]) if pd.notna(sig["target"]) else None,
+                                atr=float(last["atr"]), spread_bps=self.spreads.get(sym, 5.0),
+                                est_cost_bps=self.costs.round_trip_bps("us_equity", self.costs.spread_bps("us_equity", adv, sym)),
+                                data_age_s=0.0, signal=True, strength=float(sig["strength"]),
+                                strategy_status=r["status"], strategy_approved=bool(r["approved"]),
+                                oos_expectancy_r=r["_oos"].get("expectancy_r"), oos_trades=int(r["_oos"].get("trades", 0)),
+                                holm_p=r["_oos"].get("holm_p"), regime_allowed=(r["_allowed"] is None or reg_c in r["_allowed"]),
+                                adv=adv)
+                o.explanation = {"conditions": {"daily close": float(last["close"])}, "exit_plan": inst.exit_plan().describe(),
+                                 "bar": str(f.index[-1].date()), "feed": "SIP daily (confirmed bars)", "timeframe": "1Day"}
+                score(o, self.limits.stale_data_seconds, self.limits.max_spread_bps)
+                opps.append(o)
+        if opps:
+            self.refresh_quotes([o.symbol for o in opps])
+            for o in opps:
+                o.price = float(self.prices.get(o.symbol, o.price))
+                o.spread_bps = self.spreads.get(o.symbol, o.spread_bps)
+            self.act(opps, now)
+        self.db.kv_set("daily_cycle_done", today.isoformat())
 
     def analyze(self, now: dt.datetime) -> list[Opportunity]:
         """Stage 2 on confirmed bars. Returns scored + classified opportunities."""
@@ -312,7 +391,7 @@ class Engine:
             adv = float((self.daily[sym]["close"] * self.daily[sym]["volume"]).tail(20).mean()) \
                 if sym in self.daily and len(self.daily[sym]) else None
             self.last_closed_bar[sym] = {"close": float(last["close"]), "atr": float(last["atr"]) if pd.notna(last["atr"]) else 0.0,
-                                         "bar_minutes": BAR_MIN, "exit_sig": False}
+                                         "bar_minutes": BAR_MIN, "exit_sig": False, "tf": "5Min"}
             for r in strategies:
                 inst = r["_inst"]
                 sig = inst.signals(f).iloc[-1]
@@ -382,7 +461,8 @@ class Engine:
                 flatten_eod=ep.flatten_eod, atr=o.atr, score=o.score, regime=o.regime,
                 thesis=f"{inst.description} | score {o.score}", exit_plan=ep.describe(),
                 explanation={"opportunity": o.to_row(), "competing_opportunities": competitors,
-                             "guardian": d.to_dict()}, est_cost_bps=o.est_cost_bps, planned_risk=d.risk_dollars)
+                             "guardian": d.to_dict()}, est_cost_bps=o.est_cost_bps, planned_risk=d.risk_dollars,
+                timeframe=inst.timeframe)
             if self.tm.open_trade(plan):
                 executed += 1
         for o in opps:
@@ -405,7 +485,7 @@ class Engine:
                 self.db.insert("shadow_trades", {"trade_id": key + now.strftime("%H%M"), "strategy": o.strategy,
                                                  "symbol": o.symbol, "entry_time": now.isoformat(), "entry_price": o.price,
                                                  "status": "open", "data": {"stop": o.stop, "target": o.target,
-                                                                            "atr": o.atr}})
+                                                                            "atr": o.atr, "overnight": o.explanation.get("timeframe") == "1Day"}})
 
     def manage_shadow(self, now, flatten):
         for t in self.db.query("SELECT * FROM shadow_trades WHERE status='open'"):
@@ -418,8 +498,10 @@ class Engine:
                 reason = "stop"
             elif d.get("target") and px >= d["target"]:
                 reason = "target"
-            elif flatten:
+            elif flatten and not d.get("overnight"):
                 reason = "eod_flatten"
+            elif d.get("overnight") and (now - dt.datetime.fromisoformat(t["entry_time"])).days >= 14:
+                reason = "time_exit"
             if reason:
                 R = max(t["entry_price"] - d["stop"], 1e-9)
                 r = (px - t["entry_price"]) / R
@@ -502,7 +584,8 @@ class Engine:
         if time.monotonic() - self.last_recon > 60:
             self.reconcile()
             self.last_recon = time.monotonic()
-        self.refresh_quotes(list(dict.fromkeys(held + self.watchlist)) if sess else held)
+        shadow_syms = [r["symbol"] for r in self.db.query("SELECT DISTINCT symbol FROM shadow_trades WHERE status='open'")]
+        self.refresh_quotes(list(dict.fromkeys(held + self.watchlist + shadow_syms)) if sess else held)
         self.update_marks(now)
         # stale-data protection for held symbols
         for s in held:
@@ -527,6 +610,8 @@ class Engine:
         # Stage 1 scan (premarket and every 10 min in session)
         if time.time() - self.last_scan > 600 and self.universe:
             self.stage1(now, open_, close_)
+        if open_ + dt.timedelta(minutes=2) <= now < close_ - dt.timedelta(minutes=30):
+            self.daily_cycle(now)
         flatten = now >= close_ - dt.timedelta(minutes=10)
         cutoff = now >= close_ - dt.timedelta(minutes=30)
         # Stage 2 on each new confirmed 5-minute bar (+10 s for the bar to publish)
@@ -635,7 +720,8 @@ class Engine:
         # intraday positions left over from a previous session (e.g. crash before flatten)
         today = self.clock().astimezone(ET).date().isoformat()
         for t in self.tm.active_trades():
-            if t["session"] and t["session"] < today:
+            plan = json.loads(t["explanation"] or "{}").get("plan", {})
+            if t["session"] and t["session"] < today and plan.get("flatten_eod", True):
                 self.db.event("warning", "stale_position", f"{t['symbol']} from {t['session']} will be flattened")
                 self.tm.request_exit(t, "stale_intraday_position")
         if not self.universe or self.db.kv_get("universe_date") != today:

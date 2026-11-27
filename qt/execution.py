@@ -166,6 +166,7 @@ class TradePlan:
     est_cost_bps: float = 0.0
     planned_risk: float = 0.0
     max_entry_slippage_bps: float = 15.0
+    timeframe: str = "5Min"
 
 
 class TradeManager:
@@ -420,6 +421,8 @@ class TradeManager:
                                         (t["trade_id"],)):
                 self._place_stop(t)
             bar = bars_closed.get(sym)
+            if bar and bar.get("tf", "5Min") != plan.get("timeframe", "5Min"):
+                bar = None  # never trail a daily trade with intraday ATR (or vice versa)
             if bar:
                 atr = bar.get("atr") or 0
                 gain = bar["close"] - entry
@@ -433,7 +436,7 @@ class TradeManager:
                 if bar.get("exit_sig"):
                     self.request_exit(self.trade(t["trade_id"]), "thesis_invalidated")
                     continue
-                if plan.get("max_bars") and t["entry_time"]:
+                if plan.get("max_bars") and t["entry_time"] and plan.get("timeframe", "5Min") == "5Min":
                     held_min = (now - dt.datetime.fromisoformat(t["entry_time"])).total_seconds() / 60
                     if held_min >= plan["max_bars"] * bar.get("bar_minutes", 5):
                         self.request_exit(self.trade(t["trade_id"]), "time_exit")
