@@ -1254,8 +1254,20 @@ class Engine:
                 signal.signal(sig, lambda *_: self._stop.set())
             except ValueError:
                 pass
+        # Watchdog heartbeat: a long step inside one cycle (daily-bar download for 340 symbols, the after-close
+        # signal preview, first crypto history) can take several minutes on the small server. Keep the health
+        # check green while the loop is making progress; a cycle stuck for 20+ minutes still stops the beats
+        # so autoheal restarts the engine.
+        self._cycle_started = time.monotonic()
+
+        def watchdog():
+            while not self._stop.wait(30):
+                if time.monotonic() - self._cycle_started < 1200:
+                    self.db.heartbeat("engine", "ok", {"version": VERSION, "mode": self.s.mode, "watchdog": True})
+        threading.Thread(target=watchdog, name="watchdog-heartbeat", daemon=True).start()
         while not self._stop.is_set():
             t0 = time.monotonic()
+            self._cycle_started = t0
             try:
                 self.cycle()
                 self.integrity.pop("engine", None)
