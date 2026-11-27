@@ -85,7 +85,10 @@ def create_app(settings=None, db: DB | None = None) -> FastAPI:
             raise HTTPException(429, "too many attempts; wait 15 minutes")
         body = await request.json()
         user, pw = str(body.get("username", "")), str(body.get("password", ""))
-        ok = user == s.dashboard_user and bcrypt.checkpw(pw.encode(), s.dashboard_password_hash.encode())
+        user = user.strip().lower() if user.strip().lower() == s.dashboard_user.lower() else user
+        h = s.dashboard_password_hash.encode()
+        # phones often add a trailing space when pasting or autocompleting; accept the trimmed password too
+        ok = user == s.dashboard_user and (bcrypt.checkpw(pw.encode(), h) or (pw != pw.strip() and bcrypt.checkpw(pw.strip().encode(), h)))
         if not ok:
             attempts[ip].append(now)
             db.event("warning", "auth", f"failed dashboard login from {ip}")
