@@ -41,7 +41,7 @@ document.querySelectorAll("#tabs button").forEach((b) => b.addEventListener("cli
 function kpi(label, value, cls = "") { return `<div class="kpi"><div class="l">${esc(label)}</div><div class="v ${cls}">${value}</div></div>`; }
 function table(cols, rows, onclick) {
   const h = cols.map((c) => `<th>${esc(c[0])}</th>`).join("");
-  const b = rows.map((r, i) => `<tr ${onclick ? `class="click" data-i="${i}"` : ""}>${cols.map((c) => `<td>${c[1](r)}</td>`).join("")}</tr>`).join("");
+  const b = rows.map((r, i) => `<tr ${onclick ? `class="click" data-i="${i}"` : ""}>${cols.map((c) => `<td data-label="${esc(c[0])}">${c[1](r)}</td>`).join("")}</tr>`).join("");
   return `<div class="tw"><table><thead><tr>${h}</tr></thead><tbody>${b || `<tr><td colspan="${cols.length}" class="muted">No data yet</td></tr>`}</tbody></table></div>`;
 }
 function bindRows(el, rows, fn) { el.querySelectorAll("tr.click").forEach((tr) => tr.addEventListener("click", () => fn(rows[+tr.dataset.i]))); }
