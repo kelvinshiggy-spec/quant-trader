@@ -210,3 +210,13 @@ class SimBroker(Broker):
 
     def list_assets(self, asset_class="us_equity"):
         return []
+
+    option_data: dict = field(default_factory=dict)  # contract -> {bid, ask, delta, underlying}
+
+    def option_chain(self, underlying, exp_gte, exp_lte, kind="call"):
+        self._check()
+        return [dict(v, symbol=k, ts=self.now) for k, v in self.option_data.items() if v.get("underlying") == underlying]
+
+    def option_quotes(self, symbols):
+        self._check()
+        return {k: dict(self.option_data[k], ts=self.now) for k in symbols if k in self.option_data}

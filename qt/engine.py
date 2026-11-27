@@ -29,6 +29,7 @@ from .config import RiskLimits, Settings, check_within_ceiling, load_settings
 from .costs import CostModel
 from .data.historical import HistoricalData, to_rth
 from .books import Books
+from .options_book import NAME as OPT_NAME, OptionsBook
 from .db import DB
 from .execution import TradeManager, TradePlan
 from .guardian import AccountState, CapitalGuardian, Proposal
@@ -64,6 +65,9 @@ class Engine:
         self.tm = TradeManager(self.broker, self.db, ledger, self.notify, clock=clock)
         self.guardian = CapitalGuardian(self.limits)
         self.costs = CostModel()
+        self.options = OptionsBook(self.db)
+        self._opt_managed = None
+        self._upcoming_try = 0.0
         self.books = Books(self.db, self.limits, settings.account_type, self.costs)
         self._book_only: dict[str, list[dict]] = {}
         self.marks = self.db.kv_get("marks", {})
@@ -396,6 +400,13 @@ class Engine:
                 o.spread_bps = self.spreads.get(o.symbol, o.spread_bps)
             self.act(opps, now)
             self.feed_books(opps, now, "swing")
+            sigs = sorted([o for o in opps if o.signal and o.strategy_status in ("validated", "experimental", "promoted")
+                           and "+" not in o.strategy], key=lambda o: -o.score)
+            if sigs:
+                try:
+                    self.options.consider(sigs, self.broker, now)  # simulated options book (never ordered)
+                except Exception:  # noqa: BLE001
+                    log.exception("options book entry failed")
         self.db.kv_set("daily_cycle_done", stamp)
 
     # ------------------------------------------------------------ crypto (24/7, hourly)
@@ -958,10 +969,17 @@ class Engine:
             if now > close_ and self.db.kv_get("books_evaluated") != today.isoformat():
                 try:
                     self.books.evaluate(now)
-                    self.upcoming_signals(today)
                 except Exception:  # noqa: BLE001
                     log.exception("end-of-day book evaluation failed")
                 self.db.kv_set("books_evaluated", today.isoformat())
+            if now > close_ + dt.timedelta(minutes=20) and self.db.kv_get("upcoming_done") != today.isoformat() \
+                    and time.time() - self._upcoming_try > 1800:
+                self._upcoming_try = time.time()
+                try:
+                    self.upcoming_signals(today)
+                    self.db.kv_set("upcoming_done", today.isoformat())
+                except Exception:  # noqa: BLE001
+                    log.exception("next-session signal preview failed (retrying in 30 min)")
             self.publish_status(now)
             return
         self.ensure_daily(today)
@@ -992,6 +1010,19 @@ class Engine:
         for v in self.crypto_closed_bar.values():
             v["exit_sig"] = False
         self.manage_shadow(now, flatten)
+        if open_ + dt.timedelta(minutes=5) <= now <= close_ and self._opt_managed != pd.Timestamp(now).floor("15min"):
+            self._opt_managed = pd.Timestamp(now).floor("15min")
+            try:
+                closes = {}
+                for t in self.options.open_trades():
+                    d = self.daily.get(t["underlying"])
+                    if d is not None and len(d):
+                        d = d[d.index.tz_convert(ET).date < now.astimezone(ET).date()]
+                        if len(d):
+                            closes[t["underlying"]] = float(d["close"].iloc[-1])
+                self.options.manage(self.broker, self.prices, now, closes)
+            except Exception:  # noqa: BLE001
+                log.exception("options book management failed")
         if open_ <= now <= close_:
             try:
                 self.books.manage(self.prices, self.last_closed_bar, now, flatten, self.spreads, stocks_only=True)
@@ -1045,6 +1076,13 @@ class Engine:
                              forward=fwd.get(name, {}).get("status", "testing"), forward_why=fwd.get(name, {}).get("why"),
                              real_paper_orders=bool(trading and inst.timeframe != "1Hour"),
                              holdout_mean_r=hold.get("expectancy_r"), holdout_trades=hold.get("trades")))
+        o = self.options.stats()
+        rows.append(dict(o, timeframe="1Day", asset_class="us_option",
+                         description="One listed call (21-60 days, delta 0.3-0.7) on each swing signal the bot trades; "
+                                     "simulated only, buys at the ask and sells at the bid.",
+                         research_status="forward test only", forward="testing (owner: simulated only)",
+                         forward_why="Options are never ordered (owner's choice 2026-11-27).", real_paper_orders=False,
+                         holdout_mean_r=None, holdout_trades=None))
         opens = self.books.open_trades()
         self.db.kv_set("books", {"at": now.isoformat(), "strategies": rows,
                                  "prices": {t["symbol"]: self.prices.get(t["symbol"]) for t in opens}})

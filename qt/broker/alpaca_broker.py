@@ -60,6 +60,7 @@ class AlpacaBroker(Broker):
         self.stock = StockHistoricalDataClient(api_key, api_secret)
         self.crypto = CryptoHistoricalDataClient(api_key, api_secret)
         self.feed = data_feed
+        self._key, self._secret = api_key, api_secret
         self._asset_cache: dict[str, tuple[float, dict]] = {}
 
     # ---------- account ----------
@@ -205,6 +206,44 @@ class AlpacaBroker(Broker):
                     out[s] = {"bid": float(v.bid_price or 0), "ask": float(v.ask_price or 0), "ts": v.timestamp}
         except Exception as e:  # noqa: BLE001
             raise _classify(e) from e
+        return out
+
+    # ---------- options market data (read-only: the options book never sends orders) ----------
+    def _opt(self):
+        if getattr(self, "_option_client", None) is None:
+            from alpaca.data.historical.option import OptionHistoricalDataClient
+            self._option_client = OptionHistoricalDataClient(self._key, self._secret)
+        return self._option_client
+
+    def option_chain(self, underlying: str, exp_gte: dt.date, exp_lte: dt.date, kind: str = "call") -> list[dict]:
+        from alpaca.data.requests import OptionChainRequest
+        try:
+            ch = self._opt().get_option_chain(OptionChainRequest(
+                underlying_symbol=underlying, type=kind, expiration_date_gte=exp_gte, expiration_date_lte=exp_lte))
+        except Exception as e:  # noqa: BLE001
+            raise _classify(e) from e
+        out = []
+        for sym, v in ch.items():
+            q = v.latest_quote
+            out.append({"symbol": sym, "bid": float(q.bid_price or 0) if q else 0.0, "ask": float(q.ask_price or 0) if q else 0.0,
+                        "ts": q.timestamp if q else None, "delta": float(v.greeks.delta) if v.greeks and v.greeks.delta is not None else None,
+                        "iv": float(v.implied_volatility) if v.implied_volatility is not None else None})
+        return out
+
+    def option_quotes(self, symbols: list[str]) -> dict[str, dict]:
+        from alpaca.data.requests import OptionSnapshotRequest
+        if not symbols:
+            return {}
+        try:
+            snap = self._opt().get_option_snapshot(OptionSnapshotRequest(symbol_or_symbols=symbols))
+        except Exception as e:  # noqa: BLE001
+            raise _classify(e) from e
+        out = {}
+        for sym, v in snap.items():
+            q = v.latest_quote
+            if q:
+                out[sym] = {"bid": float(q.bid_price or 0), "ask": float(q.ask_price or 0), "ts": q.timestamp,
+                            "delta": float(v.greeks.delta) if v.greeks and v.greeks.delta is not None else None}
         return out
 
     def snapshots(self, symbols: list[str]) -> dict[str, dict]:

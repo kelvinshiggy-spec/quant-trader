@@ -199,7 +199,15 @@ def create_app(settings=None, db: DB | None = None) -> FastAPI:
             t["pnl_now"] = (px - t["entry_price"]) * t["qty"] - (t["fees"] or 0) if px else None
         closed = db.query("SELECT strategy, engine, symbol, entry_time, exit_time, entry_price, exit_price, pnl, r, "
                           "exit_reason, fees FROM book_trades WHERE status='closed' ORDER BY exit_time DESC LIMIT 100")
-        return {"as_of": b.get("at"), "capital": BOOK_CAPITAL, "strategies": b.get("strategies", []),
+        from ..options_book import RULES as OPT_RULES, SCHEMA as OPT_SCHEMA
+        for stmt in OPT_SCHEMA.strip().split(";"):
+            if stmt.strip():
+                db.execute(stmt)
+        options = {"rules": OPT_RULES, "last": db.kv_get("optbook_last") or {},
+                   "trades": db.query("SELECT signal_strategy, underlying, contract, status, entry_time, entry_premium, "
+                                      "last_bid, stop_premium, expiry, delta, exit_time, exit_premium, pnl, r, exit_reason "
+                                      "FROM options_trades ORDER BY entry_time DESC LIMIT 50")}
+        return {"as_of": b.get("at"), "capital": BOOK_CAPITAL, "strategies": b.get("strategies", []), "options": options,
                 "open": opens, "closed": closed, "promote_rule": PROMOTE, "demote_rule": DEMOTE,
                 "market": market_status(),
                 "note": ("Every strategy runs its own simulated $100 book on the same live prices, the same cost model "

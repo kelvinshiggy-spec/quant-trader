@@ -117,11 +117,11 @@ async function renderScanner() {
 async function renderBooks() {
   const d = await api("/api/books");
   const rows = (d.strategies || []).slice().sort((a, b) => (b.return_pct - a.return_pct) || (b.closed_trades - a.closed_trades));
-  const eng = (e) => ({day: "Day trading", swing: "Swing", crypto: "Crypto 24/7"}[e] || e);
+  const eng = (e) => ({day: "Day trading", swing: "Swing", crypto: "Crypto 24/7", options: "Options (simulated)"}[e] || e);
   const sum = (e) => rows.filter((r) => r.engine === e);
   const tot = (e) => sum(e).reduce((a, r) => a + (r.equity - d.capital), 0);
   const pr = d.promote_rule || {}, dr = d.demote_rule || {};
-  $("#books").innerHTML = `<div class="grid">${["day", "swing", "crypto"].map((e) => kpi(eng(e) + " books P&L", money(tot(e)), sgn(tot(e)))).join("")}
+  $("#books").innerHTML = `<div class="grid">${["day", "swing", "crypto", "options"].map((e) => kpi(eng(e) + " books P&L", money(tot(e)), sgn(tot(e)))).join("")}
     ${kpi("Open simulated trades", (d.open || []).length)}</div>
     <div class="card"><h2>Strategy portfolios ($${num(d.capital, 0)} each)</h2><p class="muted small">${esc(d.note)} Updated ${esc(d.as_of || "-")}.</p>
     ${table([["Strategy", (r) => esc(r.strategy)], ["Engine", (r) => esc(eng(r.engine))],
@@ -135,6 +135,14 @@ async function renderBooks() {
     <div class="card"><h2>Open simulated trades</h2>${table([["Strategy", (r) => esc(r.strategy)], ["Symbol", (r) => esc(r.symbol)],
       ["Entry", (r) => num(r.entry_price)], ["Now", (r) => num(r.current_price)], ["Stop", (r) => num(r.stop)],
       ["P&L", (r) => `<span class="${sgn(r.pnl_now)}">${money(r.pnl_now)}</span>`], ["Since", (r) => esc((r.entry_time || "").slice(0, 16))]], d.open || [])}</div>
+    <div class="card"><h2>Options book (simulated only)</h2><p class="muted small">Buys one call on each swing signal the bot trades,
+      if a contract with 21-60 days and delta 0.3-0.7 fits half the book. Buys at the ask, sells at the bid; stop at half the premium.
+      Never sends an order. Last check: ${esc((d.options && d.options.last && d.options.last.at) || "-")}
+      ${((d.options && d.options.last && d.options.last.log) || []).map((x) => esc(x.symbol + ": " + x.result)).join("; ")}</p>
+      ${table([["Contract", (r) => esc(r.contract)], ["Signal", (r) => esc(r.signal_strategy)], ["Status", (r) => esc(r.status)],
+      ["Paid", (r) => money(r.entry_premium * 100)], ["Bid now / exit", (r) => money((r.status === "open" ? r.last_bid : r.exit_premium) * 100)],
+      ["Stop", (r) => money(r.stop_premium * 100)], ["P&L", (r) => `<span class="${sgn(r.pnl)}">${money(r.pnl)}</span>`],
+      ["Exit", (r) => esc(r.exit_reason || "-")]], (d.options && d.options.trades) || [])}</div>
     <div class="card"><h2>Recent closed simulated trades</h2>${table([["Strategy", (r) => esc(r.strategy)], ["Symbol", (r) => esc(r.symbol)],
       ["P&L", (r) => `<span class="${sgn(r.pnl)}">${money(r.pnl)}</span>`], ["R", (r) => num(r.r)], ["Exit", (r) => esc(r.exit_reason)],
       ["Closed", (r) => esc((r.exit_time || "").slice(0, 16))]], d.closed || [])}</div>`;

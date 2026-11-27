@@ -101,8 +101,16 @@ class HistoricalData:
     def _fetch(self, symbols, tf, start, end, asset_class, feed) -> dict[str, pd.DataFrame]:
         from alpaca.data.enums import Adjustment, DataFeed
         from alpaca.data.requests import CryptoBarsRequest, StockBarsRequest
+        if len(symbols) > 100:  # big multi-symbol requests get connections reset; fetch in chunks
+            out = {}
+            for i in range(0, len(symbols), 100):
+                out.update(self._fetch(symbols[i:i + 100], tf, start, end, asset_class, feed))
+            return out
         s_dt = dt.datetime.combine(start, dt.time(0), tzinfo=dt.timezone.utc)
         e_dt = dt.datetime.combine(end, dt.time(23, 59), tzinfo=dt.timezone.utc)
+        if asset_class != "crypto" and feed == "sip":
+            # the free plan serves SIP data only up to 15 minutes ago; a later end is refused
+            e_dt = min(e_dt, dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=16))
         for attempt in range(5):
             try:
                 if asset_class == "crypto":

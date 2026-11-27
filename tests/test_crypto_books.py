@@ -79,6 +79,7 @@ def test_crypto_book_trades_on_weekend(tmp_path, monkeypatch):
     row = {r["strategy"]: r for r in bk["strategies"]}["Z_crypto"]
     assert row["engine"] == "crypto" and row["closed_trades"] == 1 and row["equity"] < 100 and not row["real_paper_orders"]
     assert any(r["engine"] == "swing" for r in bk["strategies"]) and bk["closed"][0]["exit_reason"] == "stop"
+    assert any(r["engine"] == "options" and not r["real_paper_orders"] for r in bk["strategies"]) and "rules" in bk["options"]
     sc = c.get("/api/scanner").json()
     assert sc["market"]["crypto"] == "open 24/7" and sc["crypto"]["evaluated"] >= 1
     assert "rejection_reasons" in sc and "upcoming" in sc
