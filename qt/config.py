@@ -102,6 +102,9 @@ class Settings:
     # owner-approved EXPERIMENTAL strategies: did NOT pass validation, trade paper anyway under every guardian
     # limit with mandatory stops; labelled unvalidated everywhere. Exact strategy names, e.g. "S_52w_high".
     experimental_strategies: tuple = ()
+    # owner override (paper only): trades although research REJECTED it; drops out if forward-demoted
+    override_strategies: tuple = ()
+    options_paper_orders: bool = False  # owner 2026-11-27: real paper option orders, own $100 book
     # PAPER ONLY, owner request 2026-11-27: if no trade opened by FORCE_TRADE_AFTER_MIN minutes after the open,
     # take the best-ranked opportunity anyway (stop, guardian limits, $100 budget, flattened by the close).
     # Recorded under strategy "FORCED_daily_min" so it never mixes with research-backed statistics.
@@ -207,6 +210,8 @@ def load_settings(env: dict | None = None, require_credentials: bool = True) -> 
         min_daily_trades=int(env.get("MIN_DAILY_TRADES", "0") or 0) if mode == "paper" else 0,
         force_trade_after_min=int(env.get("FORCE_TRADE_AFTER_MIN", "45") or 45),
         experimental_strategies=tuple(x.strip() for x in env.get("EXPERIMENTAL_STRATEGIES", "").split(",") if x.strip()),
+        options_paper_orders=_bool(env.get("OPTIONS_PAPER_ORDERS"), False),
+        override_strategies=tuple(x.strip() for x in env.get("OVERRIDE_STRATEGIES", "").split(",") if x.strip()),
         notify_level=env.get("NOTIFY_LEVEL", "important").lower(),
         telegram_token=env.get("TELEGRAM_BOT_TOKEN", ""),
         telegram_chat_id=env.get("TELEGRAM_CHAT_ID", ""),

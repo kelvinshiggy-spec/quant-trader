@@ -79,7 +79,8 @@ def classify(o: Opportunity, guardian_reasons: list[str] | None = None, stale_li
              max_spread_bps: float = 25) -> Opportunity:
     """Hard requirements first; only EXECUTE may submit orders."""
     r = []
-    if o.strategy_status not in ("validated", "experimental", "promoted"):
+    override = o.strategy_status == "override"  # owner chose to trade it (paper) despite failed research
+    if o.strategy_status not in ("validated", "experimental", "promoted", "override"):
         r.append(f"strategy {o.strategy} is {o.strategy_status} (not validated)")
     elif not o.strategy_approved:
         r.append(f"strategy {o.strategy} validated but awaiting owner approval")
@@ -89,15 +90,16 @@ def classify(o: Opportunity, guardian_reasons: list[str] | None = None, stale_li
         r.append(f"data stale ({o.data_age_s:.0f}s)")
     if o.spread_bps > max_spread_bps:
         r.append(f"spread {o.spread_bps:.1f}bps > {max_spread_bps}")
-    if (o.oos_expectancy_r or 0) <= 0:
+    if (o.oos_expectancy_r or 0) <= 0 and not override:
         r.append("no positive validated net expectancy")
     if o.stop is None or not o.stop < o.price:
         r.append("no valid stop")
     if guardian_reasons:
         r.extend(f"guardian: {x}" for x in guardian_reasons)
-    if o.signal and not r and o.score >= EXECUTE_MIN_SCORE:
+    if o.signal and not r and (o.score >= EXECUTE_MIN_SCORE or override):
         o.status = "EXECUTE"
-        o.reasons = [f"all confirmations passed; score {o.score}"]
+        o.reasons = [f"all confirmations passed; score {o.score}"] if not override else [
+            "OWNER OVERRIDE: research rejected this strategy; traded on the owner's instruction (paper)"]
     elif o.signal and not any(x.startswith(("data stale", "spread", "no valid stop", "guardian")) for x in r):
         o.status = "WATCH"
         o.reasons = r or [f"score {o.score} below {EXECUTE_MIN_SCORE}"]

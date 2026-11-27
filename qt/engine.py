@@ -46,6 +46,9 @@ from .strategies.library import BY_NAME
 log = logging.getLogger("engine")
 LOOP_SECONDS = 15
 BAR_MIN = 5
+# owner "minimize risk": an override (research-rejected) strategy stops placing paper orders once its forward
+# book has 15 closed trades with an average R at or below 0 (fixed 2026-11-27, before any forward result)
+OVERRIDE_CUT = {"min_trades": 15, "max_mean_r": 0.0}
 VERSION = "1.0.0"
 
 
@@ -65,7 +68,7 @@ class Engine:
         self.tm = TradeManager(self.broker, self.db, ledger, self.notify, clock=clock)
         self.guardian = CapitalGuardian(self.limits)
         self.costs = CostModel()
-        self.options = OptionsBook(self.db)
+        self.options = OptionsBook(self.db, self.broker, live=settings.options_paper_orders and settings.mode == "paper")
         self._opt_managed = None
         self._upcoming_try = 0.0
         self.books = Books(self.db, self.limits, settings.account_type, self.costs)
@@ -77,7 +80,7 @@ class Engine:
         self.crypto_bars: dict = {}
         self.crypto_last: dict = {}
         self.crypto_closed_bar: dict = {}  # symbol -> last confirmed hourly bar, for REAL crypto trades
-        self._crypto_hour = None
+        self._crypto_hour: dict = {}
         self._crypto_universe: list = []
         self._crypto_universe_date = None
         self._books_published = -1e9
@@ -179,7 +182,7 @@ class Engine:
                 bq = b["qty"] if b else 0.0
                 if bq + 1e-6 < p.qty:
                     issues[f"pos:{sym}"] = f"ledger holds {p.qty:.6f} but broker holds {bq:.6f}"
-            ours = {s.replace("/", "") for s in self.tm.ledger.positions}
+            ours = {s.replace("/", "") for s in self.tm.ledger.positions} | self.options.contracts_held()
             for sym, b in bpos.items():
                 dust = b.get("asset_class") == "crypto" and abs(b.get("market_value") or 0) < 0.10  # fee remainder
                 if sym not in ours and sym not in ignored and abs(b["qty"]) > 1e-9 and not dust:
@@ -263,6 +266,12 @@ class Engine:
             self.bars[s] = self.bars[s].iloc[-6000:]
 
     # ----------------------------------------------------------- strategies
+    def _override(self, name: str) -> bool:
+        """Owner override (paper only): OVERRIDE_STRATEGIES lists names, or ALL for every base strategy
+        (owner 2026-11-27: "do everything with real paper trading so we get actual results")."""
+        o = self.s.override_strategies
+        return "+" not in name and (name in o or "ALL" in o)
+
     def active_strategies(self, timeframe: str = "5Min") -> tuple[list[dict], list[dict]]:
         """(active, shadow). Daily (overnight) strategies can only be ACTIVE when ALLOW_OVERNIGHT_HOLDS
         is set by the owner; hourly crypto trades only with ALLOW_CRYPTO_EXECUTION (owner, 2026-11-27: trade anything that proves profitable)."""
@@ -283,7 +292,14 @@ class Engine:
             executable = (inst.timeframe == "5Min" or (inst.timeframe == "1Day" and self.s.allow_overnight)
                           or (inst.timeframe == "1Hour" and self.s.allow_crypto))
             fs = fwd.get(r["strategy"], {}).get("status")
-            if fs == "demoted" and r["status"] != "rejected":
+            f = fwd.get(r["strategy"], {})
+            quick_cut = (f.get("trades") or 0) >= OVERRIDE_CUT["min_trades"] and (f.get("mean_r") or 0) <= OVERRIDE_CUT["max_mean_r"]
+            if (self._override(r["strategy"]) and self.s.mode == "paper" and executable
+                    and fs != "demoted" and not quick_cut and r["status"] != "suspended"):
+                # owner override (2026-11-27, crypto trend): research rejected it, owner chose to trade it on paper.
+                # Research expectancy is NOT used (it is negative); the forward demotion rule still removes it.
+                active.append(dict(r, status="override", approved=1, _oos={**r["_oos"], "expectancy_r": None}))
+            elif fs == "demoted" and r["status"] != "rejected":
                 # forward test failed (pre-registered rule in qt/books.py): keeps running in its book only
                 book_only.append(dict(r, status="demoted", approved=0))
             elif fs == "promoted" and executable and r["status"] != "suspended":
@@ -428,70 +444,95 @@ class Engine:
         self._crypto_universe_date = today
         return self._crypto_universe
 
-    def crypto_strategies(self) -> list[dict]:
-        active, shadow = self.active_strategies("1Hour")
-        rows = active + shadow + self._book_only.get("1Hour", [])
+    CRYPTO_TFS = {"1Hour": 60, "15Min": 15}
+
+    def crypto_strategies(self, tf: str = "1Hour") -> list[dict]:
+        active, shadow = self.active_strategies(tf)
+        rows = active + shadow + self._book_only.get(tf, [])
         have = {r["strategy"] for r in rows}
         for name, cls in BY_NAME.items():  # never researched yet: still forward-tested in its own book
             inst = cls()
-            if inst.timeframe == "1Hour" and name not in have:
-                rows.append({"strategy": name, "status": "rejected", "approved": 0, "_inst": inst, "_oos": {},
-                             "_allowed": None})
+            if inst.timeframe == tf and inst.asset_class == "crypto" and name not in have:
+                f = (self.db.kv_get("forward_status", {}) or {}).get(name, {})
+                cut = f.get("status") == "demoted" or ((f.get("trades") or 0) >= OVERRIDE_CUT["min_trades"]
+                                                       and (f.get("mean_r") or 0) <= OVERRIDE_CUT["max_mean_r"])
+                if self._override(name) and self.s.allow_crypto and self.s.mode == "paper" and not cut:
+                    rows.append({"strategy": name, "status": "override", "approved": 1, "_inst": inst, "_oos": {},
+                                 "_allowed": None})
+                else:
+                    rows.append({"strategy": name, "status": "rejected", "approved": 0, "_inst": inst, "_oos": {},
+                                 "_allowed": None})
         return rows
 
     def crypto_cycle(self, now: dt.datetime) -> None:
-        """Crypto never closes: every hour on the CONFIRMED hourly bar, hourly strategies run on liquid
+        for tf, minutes in self.CRYPTO_TFS.items():
+            try:
+                self._crypto_tf(now, tf, minutes)
+            except Exception:  # noqa: BLE001
+                log.exception("crypto %s cycle failed", tf)
+
+    def _crypto_tf(self, now: dt.datetime, tf: str, minutes: int) -> None:
+        """Crypto never closes: on every CONFIRMED bar (hourly / 15-minute), crypto strategies run on liquid
         Alpaca crypto pairs (incl. PAXG gold). Strategies that are validated or forward-promoted place real paper orders (ALLOW_CRYPTO_EXECUTION); every
         signal also goes to its strategy's own simulated $100 crypto book with Alpaca's taker fees."""
         from .strategies.features import hourly_crypto_features
-        boundary = pd.Timestamp(now).floor("60min")
-        if self._crypto_hour == boundary or (now - boundary.to_pydatetime()).total_seconds() < 60:
+        boundary = pd.Timestamp(now).floor(f"{minutes}min")
+        if self._crypto_hour.get(tf) == boundary or (now - boundary.to_pydatetime()).total_seconds() < 60:
             return
-        self._crypto_hour = boundary
+        self._crypto_hour[tf] = boundary
+        strategies = self.crypto_strategies(tf)
+        if not strategies:
+            return
         syms = self.crypto_universe(now.astimezone(ET).date())
+        unis = [r["_inst"].universe for r in strategies]
+        if all(unis):  # every strategy names its pairs (e.g. BTC only): fetch just those
+            syms = [x for x in syms if any(x in u for u in unis)]
         if not syms:
             return
+        bars = self.crypto_bars.setdefault(tf, {})
         try:
-            need_full = [x for x in syms if x not in self.crypto_bars]
+            need_full = [x for x in syms if x not in bars]
             if need_full:
-                self.crypto_bars.update(self.broker.recent_bars(need_full, "1Hour", now - dt.timedelta(days=45)))
-            have = [x for x in syms if x in self.crypto_bars]
+                bars.update(self.broker.recent_bars(need_full, tf, now - dt.timedelta(days=45 if minutes >= 60 else 12)))
+            have = [x for x in syms if x in bars]
             if have:
-                new = self.broker.recent_bars(have, "1Hour", now - dt.timedelta(hours=6))
+                new = self.broker.recent_bars(have, tf, now - dt.timedelta(minutes=6 * minutes))
                 for k, d in new.items():
-                    old = self.crypto_bars.get(k)
-                    self.crypto_bars[k] = (pd.concat([old, d]).loc[lambda x: ~x.index.duplicated(keep="last")]
-                                           .sort_index().iloc[-1500:]) if old is not None else d
+                    old = bars.get(k)
+                    bars[k] = (pd.concat([old, d]).loc[lambda x: ~x.index.duplicated(keep="last")]
+                               .sort_index().iloc[-1500:]) if old is not None else d
         except BrokerError as e:
-            log.warning("crypto bars failed: %s", e)
+            log.warning("crypto %s bars failed: %s", tf, e)
             return
-        strategies = self.crypto_strategies()
         book_open = {(t["strategy"], t["symbol"]): t for t in self.books.open_trades() if "/" in t["symbol"]}
         held = {t["symbol"]: t for t in self.tm.active_trades() if "/" in t["symbol"]}
         opps, scanned, evaluated = [], 0, 0
         for sym in syms:
-            d = self.crypto_bars.get(sym)
+            d = bars.get(sym)
             if d is None or d.empty:
                 continue
             scanned += 1
-            d = d[d.index + pd.Timedelta(hours=1) <= pd.Timestamp(now)]  # confirmed bars only
+            d = d[d.index + pd.Timedelta(minutes=minutes) <= pd.Timestamp(now)]  # confirmed bars only
             if len(d) < 500:
                 continue
             f = hourly_crypto_features(d)
             f["session"] = f.index.date
             last = f.iloc[-1]
             adv = float(last["adv"]) if pd.notna(last["adv"]) else 0.0
-            self.crypto_last[sym] = {"atr": float(last["atr"]), "close": float(last["close"]), "adv": adv}
+            if tf == "1Hour" or sym not in self.crypto_last:
+                self.crypto_last[sym] = {"atr": float(last["atr"]), "close": float(last["close"]), "adv": adv}
             if sym not in self.CRYPTO_CORE and adv < self.CRYPTO_MIN_ADV:
                 continue
             evaluated += 1
             for r in strategies:
                 inst = r["_inst"]
+                if inst.universe and sym not in inst.universe:
+                    continue
                 sig = inst.signals(f).iloc[-1]
                 t = held.get(sym)
                 if t and t["strategy"] == r["strategy"]:  # real paper trade: hourly bar for trail / exit signal
                     self.crypto_closed_bar[sym] = {"close": float(last["close"]), "atr": float(last["atr"]),
-                                                   "exit_sig": bool(sig["exit_sig"]), "tf": "1Hour", "bar_minutes": 60}
+                                                   "exit_sig": bool(sig["exit_sig"]), "tf": tf, "bar_minutes": minutes}
                 if (r["strategy"], sym) in book_open:
                     if bool(sig["exit_sig"]):
                         self.books.signal_exit(r["strategy"], sym, now, self.prices, self.spreads.get(sym))
@@ -510,7 +551,7 @@ class Engine:
                                 holm_p=r["_oos"].get("holm_p"), regime_allowed=True, adv=adv or None)
                 o.explanation = {"conditions": {"hourly close": float(last["close"])},
                                  "exit_plan": inst.exit_plan().describe(), "bar": str(f.index[-1]),
-                                 "feed": "Alpaca crypto hourly (confirmed bars)", "timeframe": "1Hour"}
+                                 "feed": f"Alpaca crypto {tf} (confirmed bars)", "timeframe": tf}
                 score(o, self.limits.stale_data_seconds, self.limits.max_spread_bps)
                 opps.append(o)
         if opps:
@@ -525,8 +566,8 @@ class Engine:
             live = [o for o in opps if self._may_trade(o) and o.symbol not in held]
             if live and self.s.allow_crypto and not self.integrity:
                 self.act(live, now, summary=False)  # forward-promoted / validated crypto strategies only
-            self.feed_books(opps, now, "crypto")
-        self.db.kv_set("crypto_scan", {"at": now.isoformat(), "bar": str(boundary), "pairs": len(syms),
+            self.feed_books(opps, now, "crypto", bar_minutes=minutes)
+        self.db.kv_set("crypto_scan" if tf == "1Hour" else f"crypto_scan_{tf}", {"at": now.isoformat(), "bar": str(boundary), "pairs": len(syms),
                                        "scanned": scanned, "evaluated": evaluated,
                                        "signals": [{"strategy": o.strategy, "symbol": o.symbol, "price": o.price,
                                                     "stop": o.stop, "spread_bps": round(o.spread_bps, 1),
@@ -701,7 +742,9 @@ class Engine:
                 notional=d.notional, entry_ref=ask, stop=o.stop, target=o.target, trail_atr=ep.trail_atr,
                 trail_activate_r=ep.trail_activate_r, breakeven_r=ep.breakeven_r, max_bars=ep.max_bars,
                 flatten_eod=ep.flatten_eod, atr=o.atr, score=o.score, regime=o.regime,
-                thesis=(("EXPERIMENTAL (unvalidated, owner-approved) | " if o.strategy_status == "experimental" else "")
+                thesis=(("EXPERIMENTAL (unvalidated, owner-approved) | " if o.strategy_status == "experimental" else
+                         "OWNER OVERRIDE (research rejected it; owner chose to trade it on paper) | "
+                         if o.strategy_status == "override" else "")
                         + f"{inst.description} | score {o.score}"), exit_plan=ep.describe(),
                 explanation={"opportunity": o.to_row(), "competing_opportunities": competitors,
                              "guardian": d.to_dict(), "experimental": o.strategy_status == "experimental"}, est_cost_bps=o.est_cost_bps, planned_risk=d.risk_dollars,
@@ -810,9 +853,9 @@ class Engine:
             out.append(o)
         return out
 
-    def feed_books(self, opps: list[Opportunity], now: dt.datetime, engine: str) -> None:
+    def feed_books(self, opps: list[Opportunity], now: dt.datetime, engine: str, bar_minutes: int | None = None) -> None:
         """Every signal of every strategy goes to that strategy's own simulated $100 book (forward test)."""
-        bar_minutes = {"swing": 1440, "crypto": 60}.get(engine, BAR_MIN)
+        bar_minutes = bar_minutes or {"swing": 1440, "crypto": 60}.get(engine, BAR_MIN)
         asset_class = "crypto" if engine == "crypto" else "us_equity"
         for o in opps:
             if not o.signal or "+" in o.strategy or not o.stop:
@@ -828,7 +871,7 @@ class Engine:
 
     @staticmethod
     def _may_trade(o) -> bool:
-        return o.strategy_status in ("validated", "experimental", "promoted") and bool(o.strategy_approved)
+        return o.strategy_status in ("validated", "experimental", "promoted", "override") and bool(o.strategy_approved)
 
     def _shadow(self, opps, now):
         """Record signals of non-approved strategies as shadow trades (forward test without orders)."""
@@ -1010,6 +1053,11 @@ class Engine:
         for v in self.crypto_closed_bar.values():
             v["exit_sig"] = False
         self.manage_shadow(now, flatten)
+        if open_ <= now <= close_:
+            try:
+                self.options.poll(now)  # broker fills for real paper option orders
+            except Exception:  # noqa: BLE001
+                log.exception("options order poll failed")
         if open_ + dt.timedelta(minutes=5) <= now <= close_ and self._opt_managed != pd.Timestamp(now).floor("15min"):
             self._opt_managed = pd.Timestamp(now).floor("15min")
             try:
@@ -1052,7 +1100,7 @@ class Engine:
             except Exception:  # noqa: BLE001
                 log.exception("book publish failed")
 
-    ENGINE_OF = {"5Min": "day", "1Day": "swing", "1Hour": "crypto"}
+    ENGINE_OF = {"5Min": "day", "1Day": "swing", "1Hour": "crypto", "15Min": "crypto"}
 
     def publish_books(self, now):
         """Per-strategy $100 book standings for the dashboard (every strategy listed, even before its first trade)."""
@@ -1069,19 +1117,25 @@ class Engine:
             st = status.get(name) or {}
             hold = json.loads(st.get("holdout_metrics") or "{}") if st else {}
             trading = (fwd.get(name, {}).get("status") == "promoted" or st.get("status") == "validated" and st.get("approved")
-                       or name in self.s.experimental_strategies and st.get("status") in ("shadow", "validated"))
+                       or name in self.s.experimental_strategies and st.get("status") in ("shadow", "validated")
+                       or self._override(name) and fwd.get(name, {}).get("status") != "demoted"
+                       and not ((fwd.get(name, {}).get("trades") or 0) >= OVERRIDE_CUT["min_trades"]
+                                and (fwd.get(name, {}).get("mean_r") or 0) <= OVERRIDE_CUT["max_mean_r"]))
             rows.append(dict(r, engine=self.ENGINE_OF.get(inst.timeframe, inst.timeframe), timeframe=inst.timeframe,
                              asset_class=inst.asset_class, description=inst.description,
                              research_status=st.get("status", "not researched"),
                              forward=fwd.get(name, {}).get("status", "testing"), forward_why=fwd.get(name, {}).get("why"),
-                             real_paper_orders=bool(trading and inst.timeframe != "1Hour"),
+                             real_paper_orders=bool(trading and (inst.asset_class != "crypto" or self.s.allow_crypto)),
                              holdout_mean_r=hold.get("expectancy_r"), holdout_trades=hold.get("trades")))
         o = self.options.stats()
         rows.append(dict(o, timeframe="1Day", asset_class="us_option",
                          description="One listed call (21-60 days, delta 0.3-0.7) on each swing signal the bot trades; "
-                                     "simulated only, buys at the ask and sells at the bid.",
-                         research_status="forward test only", forward="testing (owner: simulated only)",
-                         forward_why="Options are never ordered (owner's choice 2026-11-27).", real_paper_orders=False,
+                                     "buys at the ask, sells at the bid, software stop at half the premium. Own $100.",
+                         research_status="forward test only",
+                         forward="experimental (real paper orders)" if self.options.live else "testing (simulated only)",
+                         forward_why="Owner chose real paper option orders on 2026-11-27; own $100 ledger, never the "
+                                     "stock account's cash." if self.options.live else "Simulated only.",
+                         real_paper_orders=self.options.live,
                          holdout_mean_r=None, holdout_trades=None))
         opens = self.books.open_trades()
         self.db.kv_set("books", {"at": now.isoformat(), "strategies": rows,

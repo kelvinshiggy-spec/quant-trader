@@ -1,4 +1,9 @@
-"""Simulated $100 options book (owner's choice 2026-11-27: options are forward-tested here only, never ordered).
+"""$100 options book. Owner's choices 2026-11-27: first simulated only, then (same day) "yes" to REAL PAPER option
+orders. With OPTIONS_PAPER_ORDERS=true every entry/exit below is sent to the Alpaca paper account as a limit
+order (buy at the ask, sell at the bid) and the book is updated only from broker fills; otherwise fills are
+simulated at the ask/bid. Its own $100 ledger: options never use the stock account's cash or risk limits,
+and the stock account's 0.25% per-trade limit is unchanged. Alpaca has no stop orders for options, so the
+stop is software-managed (checked every engine cycle while the market is open).
 
 What it does: when a swing strategy that the bot trades for real (validated, owner-approved experimental or
 forward-promoted) signals a stock, this book buys ONE listed call on that stock instead of the shares, if a
@@ -46,7 +51,8 @@ CREATE TABLE IF NOT EXISTS options_trades (
   trade_id TEXT PRIMARY KEY, signal_strategy TEXT, underlying TEXT, contract TEXT, status TEXT, entry_time TEXT,
   entry_premium REAL, contracts INTEGER, cost REAL, stop_premium REAL, initial_stop_premium REAL,
   underlying_entry REAL, underlying_stop REAL, expiry TEXT, strike REAL, delta REAL, iv REAL, exit_time TEXT,
-  exit_premium REAL, pnl REAL, r REAL, fees REAL, exit_reason TEXT, last_bid REAL);
+  exit_premium REAL, pnl REAL, r REAL, fees REAL, exit_reason TEXT, last_bid REAL, order_cid TEXT, order_at TEXT,
+  exit_tries INTEGER DEFAULT 0);
 CREATE INDEX IF NOT EXISTS ix_options_trades ON options_trades(status);
 """
 _OCC = re.compile(r"^([A-Z.]+)(\d{6})([CP])(\d{8})$")
@@ -59,12 +65,24 @@ def parse_occ(sym: str) -> tuple[str, dt.date, str, float] | None:
     return m.group(1), dt.datetime.strptime(m.group(2), "%y%m%d").date(), m.group(3), int(m.group(4)) / 1000.0
 
 
+ORDER_TIMEOUT_S = 120
+
+
 class OptionsBook:
-    def __init__(self, db):
-        self.db = db
+    def __init__(self, db, broker=None, live: bool = False):
+        self.db, self.broker, self.live = db, broker, live
         for stmt in SCHEMA.strip().split(";"):
             if stmt.strip():
                 self.db.execute(stmt)
+        for col in ("order_cid TEXT", "order_at TEXT", "exit_tries INTEGER DEFAULT 0"):  # tables made before
+            try:
+                self.db.execute(f"ALTER TABLE options_trades ADD COLUMN {col}")
+            except Exception:  # noqa: BLE001
+                pass
+
+    def contracts_held(self) -> set[str]:
+        return {r["contract"] for r in self.db.query(
+            "SELECT contract FROM options_trades WHERE status IN ('pending_entry','open','exiting')")}
 
     # ---------------------------------------------------------------- state
     def state(self) -> dict:
@@ -77,7 +95,8 @@ class OptionsBook:
         self.db.kv_set("optbook", st)
 
     def open_trades(self) -> list[dict]:
-        return self.db.query("SELECT * FROM options_trades WHERE status='open' ORDER BY entry_time")
+        return self.db.query("SELECT * FROM options_trades WHERE status IN ('open','pending_entry','exiting') "
+                             "ORDER BY entry_time")
 
     def _equity(self, led: Ledger) -> float:
         marks = {t["contract"]: t["last_bid"] for t in self.open_trades() if t["last_bid"] is not None}
@@ -139,21 +158,30 @@ class OptionsBook:
                 continue
             fee = RULES["fee_per_contract"]
             tid = f"op-{now.strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6]}"
+            cid = f"qt-{tid}-entry"
             try:
-                led.apply_buy_fill(c["symbol"], 100.0, c["ask"], fee, now, o.strategy, tid, asset_class="us_option")
-            except LedgerViolation as e:
-                out.append({"symbol": o.symbol, "result": str(e)})
+                if self.live:
+                    led.reserve(cid, c["ask"] * 100 + fee)
+                    self._submit(cid, c["symbol"], "buy", c["ask"])
+                else:
+                    led.apply_buy_fill(c["symbol"], 100.0, c["ask"], fee, now, o.strategy, tid, asset_class="us_option")
+            except (LedgerViolation, Exception) as e:  # noqa: BLE001
+                led.release(cid)
+                out.append({"symbol": o.symbol, "result": f"not bought: {str(e)[:80]}"})
                 continue
             stop = c["ask"] * RULES["stop_frac"]
             self.db.insert("options_trades", {
                 "trade_id": tid, "signal_strategy": o.strategy, "underlying": o.symbol, "contract": c["symbol"],
-                "status": "open", "entry_time": now.isoformat(), "entry_premium": c["ask"], "contracts": 1,
+                "status": "pending_entry" if self.live else "open", "order_cid": cid if self.live else None,
+                "order_at": now.isoformat(),
+                "entry_time": now.isoformat(), "entry_premium": c["ask"], "contracts": 1,
                 "cost": c["ask"] * 100 + fee, "stop_premium": stop, "initial_stop_premium": stop,
                 "underlying_entry": o.price, "underlying_stop": o.stop, "expiry": c["expiry"].isoformat(),
                 "strike": c["strike"], "delta": c.get("delta"), "iv": c.get("iv"), "fees": fee, "last_bid": c["bid"]})
             opens.append({"underlying": o.symbol})
             held.add(o.symbol)
-            out.append({"symbol": o.symbol, "result": f"bought 1 {c['symbol']} at {c['ask']:.2f}"})
+            out.append({"symbol": o.symbol, "result": f"{'paper order: buy' if self.live else 'bought'} 1 {c['symbol']} "
+                                                      f"at {c['ask']:.2f}"})
         st["ledger"] = led.to_dict()
         st.setdefault("created", now.isoformat())
         self._mark(st, self._equity(led))
@@ -162,7 +190,75 @@ class OptionsBook:
         return out
 
     # ---------------------------------------------------------------- exits
+    def _submit(self, cid: str, contract: str, side: str, price: float) -> dict:
+        from .broker.base import OrderSpec
+        spec = OrderSpec(cid, contract, side, "limit" if price > 0 else "market", qty=1.0,
+                         limit_price=round(price, 2) if price > 0 else None, time_in_force="day", asset_class="us_option")
+        return self.broker.submit_order(spec)
+
     def _close(self, t: dict, bid: float, reason: str, now: dt.datetime) -> None:
+        if self.live:
+            if t["status"] != "open":
+                return
+            n = (t.get("exit_tries") or 0) + 1
+            cid = f"qt-{t['trade_id']}-exit{n}"
+            try:
+                self._submit(cid, t["contract"], "sell", bid)
+            except Exception as e:  # noqa: BLE001
+                log.warning("option exit order failed for %s: %s", t["contract"], e)
+                return
+            self.db.execute("UPDATE options_trades SET status='exiting', exit_reason=?, order_cid=?, order_at=?, "
+                            "exit_tries=? WHERE trade_id=?", (reason, cid, now.isoformat(), n, t["trade_id"]))
+            return
+        self._book_sell(t, bid, reason, now)
+
+    def poll(self, now: dt.datetime) -> None:
+        """Live mode: apply broker fills to the book; cancel and retry orders that do not fill."""
+        if not self.live:
+            return
+        for t in self.db.query("SELECT * FROM options_trades WHERE status IN ('pending_entry','exiting')"):
+            try:
+                o = self.broker.get_order_by_client_id(t["order_cid"])
+            except Exception as e:  # noqa: BLE001
+                log.warning("option order status failed: %s", e)
+                continue
+            st = self.state()
+            led = Ledger.from_dict(st["ledger"])
+            if o and o["status"] == "filled":
+                px = float(o["filled_avg_price"])
+                if t["status"] == "pending_entry":
+                    fee = RULES["fee_per_contract"]
+                    led.apply_buy_fill(t["contract"], 100.0, px, fee, now, t["signal_strategy"], t["trade_id"],
+                                       asset_class="us_option", order_key=t["order_cid"])
+                    led.release(t["order_cid"])
+                    st["ledger"] = led.to_dict()
+                    self._save(st)
+                    stop = px * RULES["stop_frac"]
+                    self.db.execute("UPDATE options_trades SET status='open', entry_premium=?, cost=?, stop_premium=?, "
+                                    "initial_stop_premium=?, entry_time=? WHERE trade_id=?",
+                                    (px, px * 100 + fee, stop, stop, now.isoformat(), t["trade_id"]))
+                else:
+                    self._book_sell(t, px, t["exit_reason"], now)
+                continue
+            age = (now - dt.datetime.fromisoformat(t["order_at"])).total_seconds()
+            dead = o is None or o["status"] in ("canceled", "expired", "rejected", "done_for_day")
+            if not dead and age > ORDER_TIMEOUT_S:
+                try:
+                    self.broker.cancel_order(o["id"])
+                except Exception:  # noqa: BLE001
+                    pass
+                continue  # next poll sees it canceled
+            if dead:
+                if t["status"] == "pending_entry":
+                    led.release(t["order_cid"])
+                    st["ledger"] = led.to_dict()
+                    self._save(st)
+                    self.db.execute("UPDATE options_trades SET status='entry_failed', exit_reason='entry not filled' "
+                                    "WHERE trade_id=?", (t["trade_id"],))
+                else:  # exit not filled: back to open, the next manage() re-sends at the fresh bid
+                    self.db.execute("UPDATE options_trades SET status='open' WHERE trade_id=?", (t["trade_id"],))
+
+    def _book_sell(self, t: dict, bid: float, reason: str, now: dt.datetime) -> None:
         st = self.state()
         led = Ledger.from_dict(st["ledger"])
         led.settle(now.astimezone(ET).date())
@@ -192,6 +288,8 @@ class OptionsBook:
             return
         today = now.astimezone(ET).date()
         for t in opens:
+            if t["status"] != "open":
+                continue
             v = q.get(t["contract"])
             if not v or not v.get("bid") and not v.get("ask"):
                 continue

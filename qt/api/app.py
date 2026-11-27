@@ -203,7 +203,7 @@ def create_app(settings=None, db: DB | None = None) -> FastAPI:
         for stmt in OPT_SCHEMA.strip().split(";"):
             if stmt.strip():
                 db.execute(stmt)
-        options = {"rules": OPT_RULES, "last": db.kv_get("optbook_last") or {},
+        options = {"rules": OPT_RULES, "last": db.kv_get("optbook_last") or {}, "live": s.options_paper_orders,
                    "trades": db.query("SELECT signal_strategy, underlying, contract, status, entry_time, entry_premium, "
                                       "last_bid, stop_premium, expiry, delta, exit_time, exit_premium, pnl, r, exit_reason "
                                       "FROM options_trades ORDER BY entry_time DESC LIMIT 50")}

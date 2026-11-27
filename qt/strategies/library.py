@@ -311,6 +311,19 @@ class CryptoTrend(Strategy):
 
 
 @dataclass
+class BTC15mTrend(CryptoTrend):
+    """Owner request 2026-11-27 ("BTC 15 min"). Same rules as L_crypto_trend on 15-minute bars (windows in bars:
+    12-hour breakout, 6h/18h EMAs). Not tuned on any data."""
+    name: str = "L3_btc_15m_trend"
+    timeframe: str = "15Min"
+    universe: tuple = ("BTC/USD",)
+    description: str = "BTC 15-minute: 12-hour breakout in a 6h>18h EMA uptrend, ATR stop and trail; 0.25% taker fees."
+
+    def exit_plan(self):
+        return ExitPlan(trail_atr=self.p("trail"), trail_activate_r=0.5, flatten_eod=False, max_bars=96)
+
+
+@dataclass
 class CryptoMeanReversion(Strategy):
     name: str = "L2_crypto_reversion"
     letter: str = "L"
@@ -517,6 +530,8 @@ ALL_STRATEGIES: list[type[Strategy]] = [
 ]
 
 BY_NAME = {cls().name: cls for cls in ALL_STRATEGIES}
+# live-only (forward tested in its book and on paper; the research runner has no 15-minute crypto dataset)
+BY_NAME[BTC15mTrend().name] = BTC15mTrend
 
 
 def make(name: str, params: dict | None = None) -> Strategy:

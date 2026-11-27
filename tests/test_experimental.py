@@ -183,3 +183,14 @@ def test_daily_cycle_trades_wide_universe_and_skips_cash_like(tmp_path, monkeypa
     n = db.one("SELECT COUNT(*) c FROM opportunities")["c"]
     e.daily_cycle(t[0])
     assert db.one("SELECT COUNT(*) c FROM opportunities")["c"] == n
+
+
+def test_owner_override_trades_rejected_strategy_and_demotion_stops_it(tmp_path, monkeypatch):
+    e, db = make(tmp_path, monkeypatch, status="rejected", OVERRIDE_STRATEGIES="ALL")
+    e.startup(); e.cycle()
+    tr = db.one("SELECT * FROM trades")
+    assert tr and tr["strategy"] == "Z_test" and tr["thesis"].startswith("OWNER OVERRIDE")
+    e2, db2 = make(tmp_path / "b", monkeypatch, status="rejected", OVERRIDE_STRATEGIES="ALL")
+    db2.kv_set("forward_status", {"Z_test": {"status": "demoted"}})   # kept losing in its forward book
+    e2.startup(); e2.cycle()
+    assert db2.one("SELECT COUNT(*) c FROM trades")["c"] == 0

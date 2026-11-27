@@ -62,3 +62,39 @@ def test_breakeven_after_double_and_thesis_exit(tmp_path):
     ob.manage(b, {}, NOW + dt.timedelta(days=3), {"ABC": 17.5})                # stock closed below the signal stop
     t = db.one("SELECT * FROM options_trades")
     assert t["status"] == "closed" and t["exit_reason"] == "thesis_invalidated" and t["pnl"] > 0
+
+
+def test_live_mode_sends_paper_orders_and_books_only_fills(tmp_path):
+    db = DB(tmp_path / "o.db")
+    data = chain()
+    b = SimBroker(option_data=data, now=NOW, prices={"ABC261231C00020000": 0.44})
+    ob = OptionsBook(db, b, live=True)
+    ob.consider([Sig()], b, NOW)
+    o = [x for x in b.orders.values() if x["symbol"] == "ABC261231C00020000"][0]
+    assert o["side"] == "buy" and o["type"] == "limit" and o["limit_price"] == 0.45 and o["qty"] == 1.0
+    t = db.one("SELECT * FROM options_trades")
+    assert t["status"] == "pending_entry"
+    ob.poll(NOW)                                                       # broker filled at 0.44
+    t = db.one("SELECT * FROM options_trades")
+    assert t["status"] == "open" and t["entry_premium"] == 0.44 and abs(t["stop_premium"] - 0.22) < 1e-9
+    assert ob.contracts_held() == {"ABC261231C00020000"}
+    # stop: sell order at the bid, booked when filled
+    data["ABC261231C00020000"].update(bid=0.20, ask=0.24)
+    b.prices["ABC261231C00020000"] = 0.20
+    ob.manage(b, {}, NOW + dt.timedelta(days=1), {"ABC": 19.0})
+    assert db.one("SELECT status FROM options_trades")["status"] == "exiting"
+    ob.poll(NOW + dt.timedelta(days=1))
+    t = db.one("SELECT * FROM options_trades")
+    assert t["status"] == "closed" and t["exit_reason"] == "stop" and t["exit_premium"] == 0.20 and t["pnl"] < 0
+    assert ob.state()["ledger"]["reservations"] == {}
+
+
+def test_live_entry_not_filled_is_cancelled_and_cash_released(tmp_path):
+    db = DB(tmp_path / "o.db")
+    b = SimBroker(option_data=chain(), now=NOW, prices={"ABC261231C00020000": 0.60})  # market ran away
+    ob = OptionsBook(db, b, live=True)
+    ob.consider([Sig()], b, NOW)
+    ob.poll(NOW + dt.timedelta(minutes=5))   # cancels
+    ob.poll(NOW + dt.timedelta(minutes=6))   # sees it cancelled
+    assert db.one("SELECT status FROM options_trades")["status"] == "entry_failed"
+    assert ob.state()["ledger"]["reservations"] == {}

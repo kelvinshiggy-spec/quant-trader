@@ -67,7 +67,10 @@ def build(env: dict, overnight: bool, auto_approve: bool, experimental: str = ""
         "ALLOW_CRYPTO_EXECUTION": env.get("ALLOW_CRYPTO_EXECUTION", "false"),
         "ALLOW_OVERNIGHT_HOLDS": "true" if overnight else "false",
         "AUTO_APPROVE_VALIDATED": "true" if auto_approve else "false",
-        "EXPERIMENTAL_STRATEGIES": experimental,   # owner-approved, unvalidated, paper only
+        "EXPERIMENTAL_STRATEGIES": experimental,
+        # owner 2026-11-27: every strategy places real PAPER orders (ALL); options real paper orders, own $100
+        "OVERRIDE_STRATEGIES": env.get("OVERRIDE_STRATEGIES", ""),
+        "OPTIONS_PAPER_ORDERS": env.get("OPTIONS_PAPER_ORDERS", "false"),   # owner-approved, unvalidated, paper only
         "MIN_DAILY_TRADES": str(min_daily_trades),  # paper only; ignored in live mode
         "SWING_WIDE_UNIVERSE": env.get("SWING_WIDE_UNIVERSE", "0"),
         # owner-approved risk ceiling; only fields the owner changed differ from the spec defaults
