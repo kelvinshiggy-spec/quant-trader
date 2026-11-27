@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Rebuild the production .env from this machine's environment (keeping the server's session key and password
 # hash when unchanged) and deploy. Owner choices are read from env: EXPERIMENTAL, MIN_DAILY_TRADES,
-# SWING_WIDE_UNIVERSE, MAX_POSITIONS, ALLOW_CRYPTO_EXECUTION. Needs GCP_PROJECT and GCP_SA_KEY_B64 (or a gcloud login).
+# SWING_WIDE_UNIVERSE, MAX_POSITIONS, ALLOW_CRYPTO_EXECUTION, RISK_PER_TRADE_PCT (lower only). Needs GCP_PROJECT and GCP_SA_KEY_B64 (or a gcloud login).
 # The server's dashboard password is kept unless CHANGE_DASHBOARD_PASSWORD=1 (then DASHBOARD_PASSWORD is applied).
 set -euo pipefail
 cd "$(dirname "$0")/.."

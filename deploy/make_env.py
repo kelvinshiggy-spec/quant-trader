@@ -35,6 +35,9 @@ def _ceiling(env: dict) -> str:
     lim = RiskLimits()
     if env.get("MAX_POSITIONS"):
         lim.max_positions = int(env["MAX_POSITIONS"])  # 2026-11-27: owner approved 8 (per-trade risk unchanged)
+    if env.get("RISK_PER_TRADE_PCT"):
+        # may only LOWER per-trade risk (2026-11-27: 0.25% so 8 swing positions fit the same $2 daily risk budget)
+        lim.risk_per_trade_pct = min(lim.risk_per_trade_pct, float(env["RISK_PER_TRADE_PCT"]))
     return json.dumps(lim.to_dict(), separators=(",", ":"))
 
 
