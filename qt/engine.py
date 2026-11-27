@@ -212,7 +212,7 @@ class Engine:
         syms = list(dict.fromkeys(self.watchlist + ["SPY", "XLK", "XLF", "XLV", "XLE", "XLI", "XLY", "XLP", "XLU",
                                                      "XLB", "XLC", "XLRE"]))
         try:
-            d = self.hist._fetch(syms, "1Day", today - dt.timedelta(days=420), today - dt.timedelta(days=1),
+            d = self.hist._fetch(syms, "1Day", today - dt.timedelta(days=560), today - dt.timedelta(days=1),
                                  "us_equity", "sip")
             self.daily.update(d)
             sect = {k: self.daily[k] for k in ("XLK", "XLF", "XLV", "XLE", "XLI", "XLY", "XLP", "XLU", "XLB", "XLC",
@@ -273,8 +273,8 @@ class Engine:
     def daily_cycle(self, now: dt.datetime) -> None:
         """Once per session shortly after the open: daily (swing) strategies on CONFIRMED daily bars
         through yesterday; entries execute at today's open like the backtest; daily exits/trails."""
-        from .strategies.features import daily_features
-        from .universe import DAILY_UNIVERSE, SECTOR_ETFS
+        from .strategies.features import daily_panel
+        from .universe import DAILY_UNIVERSE
         today = now.astimezone(ET).date()
         if self.db.kv_get("daily_cycle_done") == today.isoformat():
             return
@@ -282,15 +282,15 @@ class Engine:
         missing = [x for x in DAILY_UNIVERSE if x not in self.daily]
         if missing:
             try:
-                self.daily.update(self.hist._fetch(missing, "1Day", today - dt.timedelta(days=420),
+                self.daily.update(self.hist._fetch(missing, "1Day", today - dt.timedelta(days=560),
                                                    today - dt.timedelta(days=1), "us_equity", "sip"))
             except Exception as e:  # noqa: BLE001
                 log.warning("daily universe fetch failed: %s", e)
-        feats = {s: daily_features(d) for s, d in self.daily.items() if s in DAILY_UNIVERSE and len(d) > 210}
-        rets = pd.DataFrame({s: feats[s]["ret63"] for s in SECTOR_ETFS if s in feats})
-        ranks = rets.rank(axis=1, ascending=False)
-        for s in rets.columns:
-            feats[s]["sector_rank"] = ranks[s]
+        confirmed = {}
+        for sym, d in self.daily.items():
+            if sym in DAILY_UNIVERSE and len(d) > 210:
+                confirmed[sym] = d[d.index.tz_convert(ET).date < today]  # confirmed bars only
+        feats = daily_panel(confirmed, min_len=210)
         regime_label = describe_current(self.regimes, today)["label"] if self.regimes is not None else "unknown"
         reg_c = coarse(regime_label)
         held = {t["symbol"]: t for t in self.tm.active_trades()}
@@ -298,10 +298,8 @@ class Engine:
         for r in active + shadow:
             inst = r["_inst"]
             for sym, f in feats.items():
-                if inst.name == "K_sector_rotation" and sym not in SECTOR_ETFS:
+                if inst.universe and sym not in inst.universe:
                     continue
-                if f.index[-1].astimezone(ET).date() >= today:
-                    f = f[f.index.tz_convert(ET).date < today]  # confirmed bars only
                 sig = inst.signals(f).iloc[-1]
                 last = f.iloc[-1]
                 t = held.get(sym)
@@ -626,7 +624,7 @@ class Engine:
                     for o in opps:
                         o.signal = False if o.signal else o.signal
                 self.act(opps, now)
-        self.tm.manage(self.prices, self.last_closed_bar, now, flatten)
+        self.tm.manage(self.prices, self.last_closed_bar, now, flatten, market_open=open_ <= now <= close_)
         self.manage_shadow(now, flatten)
         for k in list(self.last_closed_bar):
             self.last_closed_bar[k]["exit_sig"] = False

@@ -54,6 +54,8 @@ class Strategy:
     description: str = ""
     grid: dict = field(default_factory=dict)  # param name -> list of values (kept SMALL)
     defaults: dict = field(default_factory=dict)
+    universe: tuple = ()        # daily strategies: symbols it may trade (empty = any)
+    research_round: int = 1     # 1 = dev 2021-2024; 2 = daily strategies added later, dev 2017-2024
 
     def __post_init__(self):
         merged = dict(self.defaults)

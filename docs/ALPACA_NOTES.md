@@ -34,3 +34,15 @@ and, where marked **probed**, by submitting and cancelling real orders on this p
   position would remain overnight with no stop. On restart the engine flattens any stale position first.
 * **Duplicate prevention**: deterministic client ids (`qt-<trade>-entry`, `-stop<n>`, `-exit<n>`).
 * **Live trading**: `AlpacaBroker` refuses `paper=False` in this build.
+
+## Overnight (swing) positions
+
+Enabled on the server by the owner (`ALLOW_OVERNIGHT_HOLDS=true`, 2026-11-27).
+* Fractional stops must be DAY orders, so the broker stop expires at each close. The engine re-places it
+  in the first regular-hours cycle of the next session (within ~15 s of the open) with a new client id
+  (`-stop<n>`), at the same or a higher (trailed) price.
+* Outside regular hours the engine does bookkeeping only: no stop submissions and no software exits on
+  thin extended-hours quotes.
+* **Gap risk**: a stock that opens below its stop is sold at the open, which can be well below the stop.
+  Overnight news can therefore produce losses larger than the planned 0.5% of equity. The backtester
+  models this (gap-through stops fill at the open).

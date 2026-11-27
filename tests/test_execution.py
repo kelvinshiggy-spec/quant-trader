@@ -188,3 +188,27 @@ def test_restart_recovers_fills_that_happened_offline(env, tmp_path):
     tm2.om.poll_open()
     assert tm2.trade("T1")["status"] == "closed"
     assert "SPY" not in led2.positions
+
+
+def test_overnight_trade_survives_flatten_and_stop_is_replaced_after_expiry(env):
+    """Daily (swing) trades are not flattened at the close; when the DAY stop expires, a new
+    protective stop is placed so the position is never left without one during market hours."""
+    b, db, led, tm, clock = env
+    assert tm.open_trade(plan(flatten_eod=False, timeframe="1Day", max_bars=10))
+    first = tm.current_stop_order("T1")
+    assert first is not None
+    tm.manage({"SPY": 500.0}, {}, clock(), flatten_now=True)
+    assert tm.trade("T1")["status"] == "open"            # not flattened
+    # the broker expires the DAY stop after the close
+    b.orders[first["broker_order_id"]]["status"] = "expired"
+    clock.advance(16 * 3600)
+    tm.om.poll_open()
+    assert tm.current_stop_order("T1") is None
+    # pre-open: a thin extended-hours print below the stop must not sell, and no stop is submitted yet
+    tm.manage({"SPY": 480.0}, {}, clock(), False, market_open=False)
+    assert tm.trade("T1")["status"] == "open" and tm.current_stop_order("T1") is None
+    tm.manage({"SPY": 501.0}, {}, clock(), False)
+    again = tm.current_stop_order("T1")
+    assert again is not None and again["client_order_id"].endswith("-stop2")
+    assert again["stop_price"] == first["stop_price"]
+    assert led.positions["SPY"].qty > 0

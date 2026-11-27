@@ -34,6 +34,16 @@ from .walkforward import (add_regime, allowed_regimes, choose_on_dev, make_windo
 log = logging.getLogger("research")
 
 DEV_START, DEV_END = dt.date(2021, 1, 1), dt.date(2024, 12, 31)
+# Round-2 daily strategies (O-S) use the longer daily history (pre-registered before their first run).
+DEV2_START = dt.date(2017, 1, 1)
+
+
+def dev_start_for(inst) -> dt.date:
+    return DEV2_START if getattr(inst, "research_round", 1) >= 2 else DEV_START
+
+
+def in_universe(inst, sym: str) -> bool:
+    return not inst.universe or sym in inst.universe
 HOLDOUT_START = dt.date(2025, 1, 1)
 META_FEATURES = ["relvol", "adx", "rsi14", "atr_pct", "minutes", "gap", "bbw_rank", "rs6"]
 
@@ -178,9 +188,7 @@ def run(workers: int = 4, symbols: list[str] | None = None, end: dt.date | None 
         inst = cls()
         if inst.timeframe == "5Min":
             continue
-        frames = other_frames[inst.timeframe]
-        if inst.name == "K_sector_rotation":
-            frames = {k: v for k, v in frames.items() if k in SECTOR_ETFS}
+        frames = {k: v for k, v in other_frames[inst.timeframe].items() if in_universe(inst, k)}
         for p in cls.param_sets():
             tr, _ = _run_param_set(cls, p, frames)
             all_trades[(inst.name, _pkey(p))] = tr
@@ -195,14 +203,16 @@ def run(workers: int = 4, symbols: list[str] | None = None, end: dt.date | None 
         tbp = {k: add_regime(all_trades.get((inst.name, k), {}).get(1.0, pd.DataFrame()), reg_map) for k in keys}
         tbp_s2 = {k: all_trades.get((inst.name, k), {}).get(2.0, pd.DataFrame()) for k in keys}
         default = _pkey(inst.defaults) if _pkey(inst.defaults) in tbp else keys[0]
+        dev_a = dev_start_for(inst)
+        swin = windows if dev_a == DEV_START else make_windows(dev_a, DEV_END)
         for gated in (False, True):
             variant = f"{inst.name}{'+regime' if gated else ''}"
-            oos, wlog = walk_forward(tbp, windows, default, gated=gated)
-            chosen = choose_on_dev(tbp, DEV_START, DEV_END, default)
+            oos, wlog = walk_forward(tbp, swin, default, gated=gated)
+            chosen = choose_on_dev(tbp, dev_a, DEV_END, default)
             hold = slice_trades(tbp[chosen], HOLDOUT_START, end)
             allowed = None
             if gated:
-                allowed = allowed_regimes(slice_trades(tbp[chosen], DEV_START, DEV_END))
+                allowed = allowed_regimes(slice_trades(tbp[chosen], dev_a, DEV_END))
                 hold = hold[hold["regime_coarse"].isin(allowed)] if hold is not None and not hold.empty else hold
             # stress 2x on the same OOS selections
             s2 = []
@@ -224,7 +234,8 @@ def run(workers: int = 4, symbols: list[str] | None = None, end: dt.date | None 
                 "chosen_params": json.loads(chosen), "allowed_regimes": sorted(allowed) if allowed is not None else None,
                 "windows": wlog,
                 "monte_carlo": _clean(monte_carlo_drawdown(oos["r"].to_numpy())) if not oos.empty else {},
-                "dev_full": summarize(slice_trades(tbp[chosen], DEV_START, DEV_END)),
+                "dev_full": summarize(slice_trades(tbp[chosen], dev_a, DEV_END)),
+                "dev_period": f"{dev_a}..{DEV_END}", "research_round": getattr(inst, "research_round", 1),
             }
             # filter ablation (relative-volume confirmation removed)
             if "relvol" in inst.defaults:
@@ -282,9 +293,7 @@ def run(workers: int = 4, symbols: list[str] | None = None, end: dt.date | None 
         if inst.timeframe == "5Min":
             frames_iter = ((sym, ds.intraday_feats([sym])[sym]) for sym in symbols)
         else:
-            fr = other_frames[inst.timeframe]
-            if n == "K_sector_rotation":
-                fr = {k: f for k, f in fr.items() if k in SECTOR_ETFS}
+            fr = {k: f for k, f in other_frames[inst.timeframe].items() if in_universe(inst, k)}
             frames_iter = iter(fr.items())
         allowed = set(rep["allowed_regimes"]) if rep["allowed_regimes"] is not None else None
         sim, _ = constrained_sim(n, rep["chosen_params"], frames_iter, HOLDOUT_START, end, allowed, regmap_coarse,
@@ -299,7 +308,7 @@ def run(workers: int = 4, symbols: list[str] | None = None, end: dt.date | None 
                "tests_corrected": len(pvals), "duration_s": round(time.time() - t0),
                "meta_model": meta, "reports": reports,
                "spy_buy_hold_holdout_pct": _bh(daily["SPY"], HOLDOUT_START, end)}
-    persist(db, summary, data_dir)
+    persist(db, summary, data_dir, auto_approve=s.auto_approve_validated)
     return summary
 
 
@@ -349,7 +358,7 @@ def meta_model_experiment(all_trades: dict, windows) -> dict:
                    "decision": "keep researching; NOT used in production unless it beats the simple baseline OOS"})
 
 
-def persist(db: DB, summary: dict, data_dir: Path) -> None:
+def persist(db: DB, summary: dict, data_dir: Path, auto_approve: bool = False) -> None:
     run_id = summary["run_id"]
     for v, rep in summary["reports"].items():
         db.insert("experiments", {
@@ -363,14 +372,19 @@ def persist(db: DB, summary: dict, data_dir: Path) -> None:
             "status": rep["status"]})
         prev = db.one("SELECT * FROM strategy_status WHERE strategy=?", (v,))
         approved = int(prev["approved"]) if prev else 0
+        approved_at = prev["approved_at"] if prev else None
         status = rep["status"]
         if prev and prev["approved"] and status != "validated":
             status = "suspended"
+        if auto_approve and status == "validated" and not approved:
+            approved, approved_at = 1, summary["created_at"]
+            db.event("important", "research", f"{v} passed validation and was auto-approved for paper trading",
+                     {"run_id": run_id, "oos": rep["oos"], "holdout": rep["holdout"]})
         hist = json.loads(prev["history"]) if prev and prev["history"] else []
         hist.append({"run_id": run_id, "status": rep["status"], "params": rep["chosen_params"]})
         db.upsert("strategy_status", {
             "strategy": v, "version": rep["version"], "params": json.dumps(rep["chosen_params"]), "status": status,
-            "approved": approved, "approved_at": prev["approved_at"] if prev else None, "champion": 0,
+            "approved": approved, "approved_at": approved_at, "champion": 0,
             "oos_metrics": {**rep["oos"], "holm_p": rep["holm_p"]}, "holdout_metrics": rep["holdout"],
             "forward_metrics": prev["forward_metrics"] if prev else None,
             "allowed_regimes": rep["allowed_regimes"], "reason": "; ".join(rep["fail_reasons"]) or "passed all criteria",

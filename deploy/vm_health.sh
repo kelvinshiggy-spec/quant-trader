@@ -1,0 +1,38 @@
+#!/bin/bash
+# Every 5 minutes on the server: write a plain-text health report to the private bucket (so the owner, or
+# Claude with the deploy key, can check the bot without SSH) and apply a new release if one was published.
+# The report holds container states, health endpoints, resources and recent log lines; never .env contents.
+set -uo pipefail
+APP=/opt/quant-trader
+BUCKET=gs://__BUCKET__
+cd "$APP/repo" || exit 0
+DOMAIN=$(grep -E '^DASHBOARD_DOMAIN=' "$APP/.env" | cut -d= -f2-)
+OUT=$(mktemp)
+{
+  echo "time_utc: $(date -u +%FT%TZ)"
+  echo "release: $(cat "$APP/release.txt" 2>/dev/null)"
+  echo "uptime: $(uptime -p)"
+  echo "dashboard: https://$DOMAIN"
+  echo "--- containers"
+  docker compose ps --format '{{.Service}} {{.State}} {{.Health}} {{.Status}}'
+  echo "--- api /api/health (local)"
+  curl -s -m 10 http://127.0.0.1:8080/api/health; echo
+  echo "--- dashboard over public HTTPS"
+  curl -s -m 15 -o /dev/null -w 'http=%{http_code} tls_verify=%{ssl_verify_result}\n' "https://$DOMAIN/api/health"
+  echo "--- resources"
+  free -m | head -3; df -h / | tail -1
+  echo "--- clock"
+  timedatectl show -p NTPSynchronized --value | sed 's/^/ntp_synchronized=/'
+  echo "--- engine log (last 60 lines)"
+  docker compose logs --no-color --tail 60 engine 2>&1 | sed -E 's/(key|secret|token|password)[^ ]*=[^ ]+/\1=<redacted>/Ig'
+  echo "--- research log (last 30 lines)"
+  docker compose logs --no-color --tail 30 research 2>&1 | sed -E 's/(key|secret|token|password)[^ ]*=[^ ]+/\1=<redacted>/Ig'
+} > "$OUT" 2>&1
+gcloud storage cp "$OUT" "$BUCKET/status/health.txt" >/dev/null 2>&1
+rm -f "$OUT"
+
+# self-update: a new release pointer -> re-run the boot script (idempotent; the engine reconciles on restart)
+NEW=$(gcloud storage cat "$BUCKET/release.txt" 2>/dev/null || true)
+if [ -n "$NEW" ] && [ "$NEW" != "$(cat "$APP/release.txt" 2>/dev/null)" ]; then
+  google_metadata_script_runner startup >/var/log/qt-update.log 2>&1 || true
+fi

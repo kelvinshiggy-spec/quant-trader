@@ -3,9 +3,12 @@
 #   - installs Docker, creates swap, clones/updates the repo, starts the stack
 #   - Docker restarts every service on crash and on reboot; autoheal restarts unhealthy ones
 # Usage: REPO_URL=... REPO_REF=main bash install.sh   (.env must already exist in /opt/quant-trader)
+#    or: SRC_DIR=/opt/quant-trader/repo DATA_DIR=/opt/quant-trader/data bash install.sh   (code already unpacked,
+#        as done by the Google Cloud boot script; no git or GitHub token needed)
 set -euo pipefail
-APP=/opt/quant-trader
-REPO_URL="${REPO_URL:?set REPO_URL}"
+APP="${APP_DIR:-/opt/quant-trader}"
+SRC_DIR="${SRC_DIR:-}"
+DATA_DIR="${DATA_DIR:-}"
 REPO_REF="${REPO_REF:-main}"
 export DEBIAN_FRONTEND=noninteractive
 
@@ -25,15 +28,26 @@ fi
 timedatectl set-ntp true || true
 
 mkdir -p "$APP"
-if [ ! -d "$APP/repo/.git" ]; then
-  git clone --branch "$REPO_REF" "$REPO_URL" "$APP/repo"
-else
-  git -C "$APP/repo" fetch origin "$REPO_REF" && git -C "$APP/repo" checkout -q FETCH_HEAD
+if [ -z "$SRC_DIR" ]; then
+  REPO_URL="${REPO_URL:?set REPO_URL or SRC_DIR}"
+  if [ ! -d "$APP/repo/.git" ]; then
+    git clone --branch "$REPO_REF" "$REPO_URL" "$APP/repo"
+  else
+    git -C "$APP/repo" fetch origin "$REPO_REF" && git -C "$APP/repo" checkout -q FETCH_HEAD
+  fi
 fi
 [ -f "$APP/.env" ] || { echo "missing $APP/.env"; exit 1; }
 chmod 600 "$APP/.env"
 ln -sf "$APP/.env" "$APP/repo/.env"
-mkdir -p "$APP/repo/data" && chown -R 10001:10001 "$APP/repo/data"
+if [ -n "$DATA_DIR" ]; then
+  # data lives outside the code directory so releases can be replaced without touching the database
+  mkdir -p "$DATA_DIR"
+  [ -d "$APP/repo/data" ] && [ ! -L "$APP/repo/data" ] && rm -rf "$APP/repo/data"
+  ln -sfn "$DATA_DIR" "$APP/repo/data"
+  chown -R 10001:10001 "$DATA_DIR"
+else
+  mkdir -p "$APP/repo/data" && chown -R 10001:10001 "$APP/repo/data"
+fi
 
 cd "$APP/repo"
 docker compose up -d --build

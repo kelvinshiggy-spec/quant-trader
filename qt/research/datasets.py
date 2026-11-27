@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 
 from ..data.historical import HistoricalData, to_rth
-from ..strategies.features import daily_features, hourly_crypto_features, intraday_features
+from ..strategies.features import daily_panel, hourly_crypto_features, intraday_features
 from ..universe import CRYPTO, DAILY_UNIVERSE, INTRADAY_UNIVERSE, SECTOR_ETFS
 
 log = logging.getLogger(__name__)
@@ -29,17 +29,7 @@ class Datasets:
         return self._daily
 
     def daily_feats(self) -> dict[str, pd.DataFrame]:
-        raw = self.daily_raw()
-        out = {s: daily_features(d) for s, d in raw.items() if not d.empty}
-        # cross-sectional sector momentum rank (known at each close)
-        rets = pd.DataFrame({s: out[s]["ret63"] for s in SECTOR_ETFS if s in out})
-        ranks = rets.rank(axis=1, ascending=False)
-        for s in rets.columns:
-            out[s]["sector_rank"] = ranks[s]
-        for s, f in out.items():
-            f["session"] = [x.tz_convert("America/New_York").date() for x in f.index]
-            f["adv"] = f["dollar_vol20"].shift(1)
-        return out
+        return daily_panel(self.daily_raw())
 
     def crypto_feats(self) -> dict[str, pd.DataFrame]:
         raw = self.hd.bars(CRYPTO, "1Hour", self.start, self.end, asset_class="crypto")

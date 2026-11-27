@@ -28,8 +28,9 @@ a champion/challenger Strategy Tournament and a mobile-friendly dashboard.
                       api container (FastAPI, auth) + Caddy HTTPS  ->  dashboard
 ```
 
-Only strategies that are **validated by research AND approved by you** (one click in the Tournament
-tab) can place paper orders. Everything else runs in **shadow mode**: its live signals are tracked as
+Only strategies that are **validated by research** can place paper orders. Approval is either one click in
+the Tournament tab or, if the owner opted in with `AUTO_APPROVE_VALIDATED=true` (the deployed setting),
+automatic; an approved strategy that fails a later run or its forward test is suspended automatically. Everything else runs in **shadow mode**: its live signals are tracked as
 forward tests without orders. If nothing qualifies, the bot stays in cash.
 
 ## Repository layout
@@ -68,19 +69,33 @@ python -m qt.api.app            # dashboard on http://127.0.0.1:8080
 
 ## Deployment (always-on server)
 
-Requirements: any small Linux VM (Debian 12 / Ubuntu 22.04+, 1 GB RAM + swap is enough).
+**Google Cloud (used for this bot).** From any machine with `gcloud`:
 
-1. Create `/opt/quant-trader/.env` from `.env.example` (paper keys, dashboard password hash from
-   `python -m scripts.hash_password`, `SESSION_SECRET`, `DASHBOARD_DOMAIN`).
-2. `REPO_URL=https://x-access-token:<read-only token>@github.com/kelvinshiggy-spec/quant-trader.git REPO_REF=main bash deploy/install.sh`
+```bash
+ALPACA_PAPER_API_KEY=... ALPACA_PAPER_API_SECRET=... DASHBOARD_PASSWORD=... \
+  python -m deploy.make_env /secure/path/prod.env --overnight --auto-approve
+GCP_PROJECT=<project-id> ENV_FILE=/secure/path/prod.env bash deploy/gcp_deploy.sh
+```
 
-What you get: Docker installs and starts on boot; every container has `restart: unless-stopped`;
+`gcp_deploy.sh` creates (idempotently) an e2-micro VM in us-west1 with a 30 GB standard disk (Always Free
+machine and disk), a static IP (billed by Google, about $3.60/month), a firewall rule for 80/443, a VM
+service account that can read only its own secret and bucket, a private Cloud Storage bucket, and the
+`qt-env` secret in Secret Manager. No GitHub token is needed: the committed code is shipped to the bucket as
+`releases/release-<commit>.tar.gz`, and the first boot also gets a seed research DB and the market-data
+cache. On every boot `deploy/vm_boot.sh` pulls the secret and release and runs `deploy/install.sh`.
+A systemd timer (`deploy/vm_health.sh`) writes `status/health.txt` to the bucket every 5 minutes and applies
+a newly published release without a reboot. Re-running `gcp_deploy.sh` publishes an update.
+
+Check the server without SSH: `gcloud storage cat gs://<project>-qt-deploy/status/health.txt`.
+
+**Any other Linux VM** (Debian 12 / Ubuntu 22.04+, 1 GB RAM + swap is enough):
+create `/opt/quant-trader/.env`, then
+`REPO_URL=https://x-access-token:<read-only token>@github.com/kelvinshiggy-spec/quant-trader.git REPO_REF=main bash deploy/install.sh`.
+
+What you get either way: Docker installs and starts on boot; every container has `restart: unless-stopped`;
 health checks on engine/API/research; `autoheal` restarts unhealthy containers; logs rotate; the
 database is backed up daily (14 kept, `data/backups`); Caddy serves the dashboard over HTTPS with an
 automatic certificate (`<ip-with-dashes>.sslip.io` works without buying a domain).
-
-Google Cloud free tier: `deploy/gcp_provision.sh` creates an e2-micro VM, stores `.env` and the
-deploy token in Secret Manager, and bootstraps the stack with a startup script.
 
 Operations:
 ```bash

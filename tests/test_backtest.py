@@ -195,3 +195,31 @@ def test_all_strategy_signals_are_causal():
         a = st.signals(full).iloc[:cut]
         b = st.signals(part)
         assert (a["entry"].to_numpy() == b["entry"].to_numpy()).all(), st.name
+
+
+def test_entry_skipped_when_open_gaps_below_stop():
+    """A signal whose next open is already below its stop must not create a trade (R would be <= 0)."""
+    import numpy as np
+    import pandas as pd
+    from qt.backtest.engine import BTConfig, run_backtest
+    from qt.costs import CostModel
+    from qt.strategies.base import Strategy, frame, ExitPlan
+
+    class OneShot(Strategy):
+        name = "Z_gap"
+        timeframe = "1Day"
+
+        def exit_plan(self):
+            return ExitPlan(flatten_eod=False, max_bars=2)
+
+        def signals(self, f):
+            e = np.zeros(len(f), bool)
+            e[0] = True
+            return frame(f, e, f["close"] - 1.0)
+
+    idx = pd.date_range("2024-01-02", periods=4, freq="B", tz="UTC")
+    f = pd.DataFrame({"open": [100, 95, 95, 95], "high": [101, 96, 96, 96], "low": [99, 94, 94, 94],
+                      "close": [100, 95, 95, 95], "volume": 1e6, "atr": 1.0, "adv": 1e9}, index=idx)
+    f["session"] = [x.date() for x in idx]
+    r = run_backtest(OneShot(), {"X": f}, BTConfig(capital_constrained=False, costs=CostModel(stress=0.0)))
+    assert r.trades_df().empty

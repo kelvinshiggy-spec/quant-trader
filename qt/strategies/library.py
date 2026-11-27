@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 
 from .base import ExitPlan, Strategy, frame
+from ..universe import ASSET_CLASS_SET, DAILY_UNIVERSE, INDEX_ETFS, LEGACY_DAILY, SECTOR_ETFS
 
 MIN_ADV = 5e7          # $ average daily dollar volume for intraday trading
 CUTOFF_BARS = 6        # no new intraday entries in the last 30 minutes
@@ -146,6 +147,7 @@ class TrendFollowing(Strategy):
     timeframe: str = "1Day"
     overnight: bool = True
     description: str = "Donchian 20-day breakout in a SMA50>SMA200 uptrend with ADX; chandelier trail; exit below SMA50."
+    universe: tuple = tuple(LEGACY_DAILY)
     defaults: dict = field(default_factory=lambda: {"adx": 20, "trail": 3.0})
     grid: dict = field(default_factory=lambda: {"adx": [15, 25], "trail": [2.5, 3.5]})
 
@@ -268,6 +270,7 @@ class SectorRotation(Strategy):
     timeframe: str = "1Day"
     overnight: bool = True
     description: str = "Hold sector ETFs ranked top-N by 3-month momentum and above their SMA100; exit when rank drops."
+    universe: tuple = tuple(SECTOR_ETFS)
     defaults: dict = field(default_factory=lambda: {"top": 2})
     grid: dict = field(default_factory=lambda: {"top": [2, 3]})
 
@@ -336,6 +339,7 @@ class SwingPullback(Strategy):
     timeframe: str = "1Day"
     overnight: bool = True
     description: str = "Daily RSI(2) pullback above SMA200; exit on close above SMA5 or after N days."
+    universe: tuple = tuple(LEGACY_DAILY)
     defaults: dict = field(default_factory=lambda: {"rsi2": 10, "days": 10})
     grid: dict = field(default_factory=lambda: {"rsi2": [5, 15]})
 
@@ -372,10 +376,144 @@ class IntradayMomentumLastHalfHour(Strategy):
         return frame(f, cond, stop, strength=r1 * 100)
 
 
+# ======== Round 2 (pre-registered 2026-11-27): daily / monthly hypotheses from published research ========
+MIN_ADV_ETF = 2e7
+
+
+def _month_end(f):
+    return f["td_to_month_end"] == 0
+
+
+# ---------------- O. Time-series momentum (Moskowitz, Ooi & Pedersen, 2012, JFE) ----------------
+@dataclass
+class TimeSeriesMomentum(Strategy):
+    name: str = "O_tsmom"
+    letter: str = "O"
+    timeframe: str = "1Day"
+    overnight: bool = True
+    research_round: int = 2
+    universe: tuple = tuple(ASSET_CLASS_SET)
+    description: str = ("Monthly: hold each asset-class ETF whose trailing 6/12-month return is positive; "
+                        "re-check at each month end; wide ATR stop.")
+    defaults: dict = field(default_factory=lambda: {"lookback": 252, "stop_atr": 4.0})
+    grid: dict = field(default_factory=lambda: {"lookback": [126, 252], "stop_atr": [3.0, 5.0]})
+
+    def exit_plan(self):
+        return ExitPlan(flatten_eod=False)
+
+    def signals(self, f):
+        r = f[f"ret{self.p('lookback')}"]
+        me = _month_end(f)
+        cond = me & (r > 0) & (f["dollar_vol20"] > MIN_ADV_ETF)
+        stop = f["close"] - self.p("stop_atr") * f["atr"]
+        return frame(f, cond, stop, exit_sig=me & (r < 0), strength=r / f["rv20"].replace(0, np.nan))
+
+
+# ---------------- P. Dual momentum rotation (Antonacci, 2014) ----------------
+@dataclass
+class DualMomentum(Strategy):
+    name: str = "P_dual_momentum"
+    letter: str = "P"
+    timeframe: str = "1Day"
+    overnight: bool = True
+    research_round: int = 2
+    universe: tuple = tuple(ASSET_CLASS_SET)
+    description: str = ("Monthly: hold the top-N asset-class ETFs by 6/12-month return, only if that return is "
+                        "positive (absolute momentum); rotate at month end.")
+    defaults: dict = field(default_factory=lambda: {"top": 2, "lookback": 252})
+    grid: dict = field(default_factory=lambda: {"top": [1, 2], "lookback": [126, 252]})
+
+    def exit_plan(self):
+        return ExitPlan(flatten_eod=False)
+
+    def signals(self, f):
+        lb = self.p("lookback")
+        if f"ac_rank{lb}" not in f:
+            return frame(f, False, np.nan)
+        r, rk, top = f[f"ret{lb}"], f[f"ac_rank{lb}"], self.p("top")
+        me = _month_end(f)
+        cond = me & (rk <= top) & (r > 0) & (f["dollar_vol20"] > MIN_ADV_ETF)
+        stop = f["close"] - 4.0 * f["atr"]
+        return frame(f, cond, stop, exit_sig=me & ((rk > top + 1) | (r < 0)), strength=r)
+
+
+# ---------------- Q. Turn of the month (Lakonishok & Smidt, 1988; McConnell & Xu, 2008) ----------------
+@dataclass
+class TurnOfMonth(Strategy):
+    name: str = "Q_turn_of_month"
+    letter: str = "Q"
+    timeframe: str = "1Day"
+    overnight: bool = True
+    research_round: int = 2
+    universe: tuple = tuple(INDEX_ETFS)
+    description: str = ("Buy index ETFs at the open of the last trading day of the month; sell after the first "
+                        "few trading days of the new month.")
+    defaults: dict = field(default_factory=lambda: {"hold": 3, "trend": 0})
+    grid: dict = field(default_factory=lambda: {"hold": [3, 5], "trend": [0, 1]})
+
+    def exit_plan(self):
+        return ExitPlan(max_bars=self.p("hold"), flatten_eod=False)
+
+    def signals(self, f):
+        cond = (f["td_to_month_end"] == 1) & (f["dollar_vol20"] > MIN_ADV)
+        if self.p("trend"):
+            cond = cond & (f["close"] > f["sma200"])
+        stop = f["close"] - 3.0 * f["atr"]
+        return frame(f, cond, stop, strength=pd.Series(1.0, index=f.index))
+
+
+# ---------------- R. Internal bar strength reversion (Pagonidis, 2013) ----------------
+@dataclass
+class IBSReversion(Strategy):
+    name: str = "R_ibs_reversion"
+    letter: str = "R"
+    timeframe: str = "1Day"
+    overnight: bool = True
+    research_round: int = 2
+    universe: tuple = tuple(INDEX_ETFS + SECTOR_ETFS)
+    description: str = ("Buy an index or sector ETF that closed near its daily low (low IBS) in a long-term "
+                        "uptrend; sell on a close above the prior day's high or after 5 days.")
+    defaults: dict = field(default_factory=lambda: {"ibs": 0.15})
+    grid: dict = field(default_factory=lambda: {"ibs": [0.1, 0.2]})
+
+    def exit_plan(self):
+        return ExitPlan(max_bars=5, flatten_eod=False)
+
+    def signals(self, f):
+        cond = (f["ibs"] < self.p("ibs")) & (f["close"] > f["sma200"]) & (f["dollar_vol20"] > MIN_ADV)
+        stop = f["close"] - 2.5 * f["atr"]
+        return frame(f, cond, stop, exit_sig=f["close"] > f["prev_high"], strength=self.p("ibs") - f["ibs"])
+
+
+# ---------------- S. 52-week-high momentum (George & Hwang, 2004, JF) ----------------
+@dataclass
+class FiftyTwoWeekHigh(Strategy):
+    name: str = "S_52w_high"
+    letter: str = "S"
+    timeframe: str = "1Day"
+    overnight: bool = True
+    research_round: int = 2
+    universe: tuple = tuple(DAILY_UNIVERSE)
+    description: str = ("Buy a fresh close above the prior 52-week high in a SMA50>SMA200 uptrend; ATR trailing "
+                        "stop; exit on a close below SMA50.")
+    defaults: dict = field(default_factory=lambda: {"trail": 3.0})
+    grid: dict = field(default_factory=lambda: {"trail": [3.0, 4.0]})
+
+    def exit_plan(self):
+        return ExitPlan(trail_atr=self.p("trail"), trail_activate_r=0.0, flatten_eod=False)
+
+    def signals(self, f):
+        brk = (f["close"] > f["hh252"]) & ~(f["close"].shift(1) > f["hh252"].shift(1))
+        cond = brk & (f["sma50"] > f["sma200"]) & (f["dollar_vol20"] > MIN_ADV)
+        stop = f["close"] - 2.5 * f["atr"]
+        return frame(f, cond, stop, exit_sig=f["close"] < f["sma50"], strength=f["ret126"])
+
+
 ALL_STRATEGIES: list[type[Strategy]] = [
     Momentum, OpeningRangeBreakout, VWAPReclaim, VWAPReversion, MeanReversion, TrendFollowing,
     RelativeStrength, VolumeBreakout, PullbackContinuation, IntradayReversal, VolatilityExpansion,
     SectorRotation, CryptoTrend, CryptoMeanReversion, SwingPullback, IntradayMomentumLastHalfHour,
+    TimeSeriesMomentum, DualMomentum, TurnOfMonth, IBSReversion, FiftyTwoWeekHigh,
 ]
 
 BY_NAME = {cls().name: cls for cls in ALL_STRATEGIES}

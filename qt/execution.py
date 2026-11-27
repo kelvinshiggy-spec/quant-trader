@@ -376,8 +376,11 @@ class TradeManager:
 
     # ---------------- periodic management ----------------
     def manage(self, prices: dict[str, float], bars_closed: dict[str, dict], now: dt.datetime,
-               flatten_now: bool) -> None:
-        """prices: latest trade/mid; bars_closed: symbol -> latest confirmed bar dict with atr/exit_sig."""
+               flatten_now: bool, market_open: bool = True) -> None:
+        """prices: latest trade/mid; bars_closed: symbol -> latest confirmed bar dict with atr/exit_sig.
+        market_open=False (pre-open / after-close windows): only bookkeeping. Overnight positions get their
+        protective stop re-placed and software exits evaluated on regular-hours prices only, so thin
+        extended-hours quotes never trigger a sale and stops are never submitted while the market is shut."""
         self.om.poll_open()
         for t in self.active_trades():
             sym = t["symbol"]
@@ -401,6 +404,8 @@ class TradeManager:
             mfe = max(t["mfe"] or 0.0, (px - entry) / R)
             mae = min(t["mae"] or 0.0, (px - entry) / R)
             self._upd(t["trade_id"], mfe=mfe, mae=mae)
+            if not market_open:
+                continue
             if flatten_now and plan.get("flatten_eod", True):
                 self.request_exit(t, "eod_flatten")
                 continue

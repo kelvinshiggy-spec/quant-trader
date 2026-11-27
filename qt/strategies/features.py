@@ -88,7 +88,59 @@ def daily_features(d: pd.DataFrame) -> pd.DataFrame:
     f["ret63"] = ind.roc(c, 63)
     f["rv20"] = ind.realized_vol(c, 20)
     f["dollar_vol20"] = (c * f["volume"]).rolling(20, min_periods=5).mean()
+    # round 2 features
+    f["ret126"] = ind.roc(c, 126)
+    f["ret252"] = ind.roc(c, 252)
+    f["hh252"] = ind.donchian_high(f["high"], 252)          # prior 252-session high (shifted, excludes today)
+    rng = (f["high"] - f["low"]).replace(0, np.nan)
+    f["ibs"] = ((c - f["low"]) / rng).fillna(0.5)            # internal bar strength
+    f["prev_high"] = f["high"].shift(1)
+    cal = month_position([x.tz_convert("America/New_York").date() if getattr(x, "tzinfo", None) else x.date()
+                          for x in f.index])
+    f["td_of_month"] = cal[0]
+    f["td_to_month_end"] = cal[1]
     return f
+
+
+def month_position(dates) -> tuple[np.ndarray, np.ndarray]:
+    """(1-based trading-day index within the month, trading days remaining after this one in the month),
+    from the exchange calendar, which is published in advance, so it is not look-ahead."""
+    from ..markettime import trading_days
+    cache: dict = {}
+    of, to_end = np.zeros(len(dates)), np.zeros(len(dates))
+    for i, d in enumerate(dates):
+        key = (d.year, d.month)
+        if key not in cache:
+            first = d.replace(day=1)
+            last = (pd.Timestamp(first) + pd.offsets.MonthEnd(0)).date()
+            cache[key] = trading_days(first, last)
+        days = cache[key]
+        if d in days:
+            k = days.index(d)
+            of[i], to_end[i] = k + 1, len(days) - 1 - k
+        else:
+            of[i], to_end[i] = np.nan, np.nan
+    return of, to_end
+
+
+def daily_panel(raw: dict[str, pd.DataFrame], min_len: int = 0) -> dict[str, pd.DataFrame]:
+    """Daily features for every symbol plus the cross-sectional columns, shared by research and the live
+    engine so both compute identical signals. Ranks use only values known at each close."""
+    from ..universe import ASSET_CLASS_SET, SECTOR_ETFS
+    out = {s: daily_features(d) for s, d in raw.items() if d is not None and len(d) > min_len}
+    rets = pd.DataFrame({s: out[s]["ret63"] for s in SECTOR_ETFS if s in out})
+    ranks = rets.rank(axis=1, ascending=False)
+    for s in rets.columns:
+        out[s]["sector_rank"] = ranks[s]
+    for lb in (126, 252):
+        r = pd.DataFrame({s: out[s][f"ret{lb}"] for s in ASSET_CLASS_SET if s in out})
+        rk = r.rank(axis=1, ascending=False)
+        for s in r.columns:
+            out[s][f"ac_rank{lb}"] = rk[s]
+    for s, f in out.items():
+        f["session"] = [x.tz_convert("America/New_York").date() for x in f.index]
+        f["adv"] = f["dollar_vol20"].shift(1)
+    return out
 
 
 def hourly_crypto_features(d: pd.DataFrame) -> pd.DataFrame:

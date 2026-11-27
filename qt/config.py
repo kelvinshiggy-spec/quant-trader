@@ -98,6 +98,7 @@ class Settings:
     session_secret: str = ""
     allow_crypto: bool = False       # 24/7 crypto execution needs separate approval
     allow_overnight: bool = False    # swing holding needs separate approval
+    auto_approve_validated: bool = False  # owner opt-in: strategies that pass validation trade without a tap
     notify_level: str = "important"  # all | important | daily | off
     telegram_token: str = ""
     telegram_chat_id: str = ""
@@ -189,6 +190,7 @@ def load_settings(env: dict | None = None, require_credentials: bool = True) -> 
         session_secret=env.get("SESSION_SECRET", ""),
         allow_crypto=_bool(env.get("ALLOW_CRYPTO_EXECUTION"), False),
         allow_overnight=_bool(env.get("ALLOW_OVERNIGHT_HOLDS"), False),
+        auto_approve_validated=_bool(env.get("AUTO_APPROVE_VALIDATED"), False),
         notify_level=env.get("NOTIFY_LEVEL", "important").lower(),
         telegram_token=env.get("TELEGRAM_BOT_TOKEN", ""),
         telegram_chat_id=env.get("TELEGRAM_CHAT_ID", ""),

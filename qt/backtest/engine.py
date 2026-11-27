@@ -239,6 +239,12 @@ def run_backtest(strategy: Strategy, frames: dict[str, pd.DataFrame], cfg: BTCon
             sp = spread_for(a, i, sym)
             fill = costs.buy_price(a.o[i], a.asset_class, sp)
             stop0 = a.stop[srow]
+            if not fill > stop0:
+                # opened at/below the planned stop: the live guardian rejects such an entry (invalid stop)
+                rejected += 1
+                if cfg.capital_constrained:
+                    ledger.release(okey)
+                continue
             if cfg.capital_constrained:
                 # fee for crypto is on notional; keep total within the reservation
                 fee_rate = costs.crypto_taker_bps * costs.stress / 1e4 if a.asset_class == "crypto" else 0.0
