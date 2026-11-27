@@ -16,7 +16,7 @@ import sys
 import bcrypt
 
 
-def build(env: dict, overnight: bool, auto_approve: bool) -> str:
+def build(env: dict, overnight: bool, auto_approve: bool, experimental: str = "", min_daily_trades: int = 0) -> str:
     key, sec, pw = env.get("ALPACA_PAPER_API_KEY", ""), env.get("ALPACA_PAPER_API_SECRET", ""), env.get("DASHBOARD_PASSWORD", "")
     missing = [n for n, v in (("ALPACA_PAPER_API_KEY", key), ("ALPACA_PAPER_API_SECRET", sec),
                               ("DASHBOARD_PASSWORD", pw)) if not v]
@@ -35,6 +35,8 @@ def build(env: dict, overnight: bool, auto_approve: bool) -> str:
         "ALLOW_CRYPTO_EXECUTION": "false",
         "ALLOW_OVERNIGHT_HOLDS": "true" if overnight else "false",
         "AUTO_APPROVE_VALIDATED": "true" if auto_approve else "false",
+        "EXPERIMENTAL_STRATEGIES": experimental,   # owner-approved, unvalidated, paper only
+        "MIN_DAILY_TRADES": str(min_daily_trades),  # paper only; ignored in live mode
         "DASHBOARD_DOMAIN": "auto",  # replaced on the server with <ip-with-dashes>.sslip.io
         "DASHBOARD_USER": env.get("DASHBOARD_USER", "admin"),
         "DASHBOARD_PASSWORD_HASH": bcrypt.hashpw(pw.encode(), bcrypt.gensalt(12)).decode(),
@@ -60,8 +62,10 @@ def main():
     ap.add_argument("out")
     ap.add_argument("--overnight", action="store_true")
     ap.add_argument("--auto-approve", action="store_true")
+    ap.add_argument("--experimental", default="", help="comma list of owner-approved unvalidated strategies (paper)")
+    ap.add_argument("--min-daily-trades", type=int, default=0, help="paper only: force this many trades per day")
     a = ap.parse_args()
-    text = build(dict(os.environ), a.overnight, a.auto_approve)
+    text = build(dict(os.environ), a.overnight, a.auto_approve, a.experimental, a.min_daily_trades)
     fd = os.open(a.out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as fh:
         fh.write(text)
@@ -70,7 +74,8 @@ def main():
     env = dict(x.split("=", 1) for x in text.strip().splitlines())
     env["DASHBOARD_PASSWORD_HASH"] = env["DASHBOARD_PASSWORD_HASH"].strip("'")
     s = load_settings(env)
-    print(f"wrote {a.out}: mode={s.mode} overnight={s.allow_overnight} auto_approve={s.auto_approve_validated}",
+    print(f"wrote {a.out}: mode={s.mode} overnight={s.allow_overnight} auto_approve={s.auto_approve_validated} "
+          f"experimental={s.experimental_strategies} min_daily_trades={s.min_daily_trades}",
           file=sys.stderr)
 
 

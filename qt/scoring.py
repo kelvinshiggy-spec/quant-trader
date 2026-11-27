@@ -32,7 +32,7 @@ class Opportunity:
     data_age_s: float
     signal: bool
     strength: float
-    strategy_status: str          # validated | shadow | rejected | suspended
+    strategy_status: str          # validated | experimental (owner-approved, unvalidated) | shadow | rejected | suspended
     strategy_approved: bool
     oos_expectancy_r: float | None
     oos_trades: int
@@ -79,7 +79,7 @@ def classify(o: Opportunity, guardian_reasons: list[str] | None = None, stale_li
              max_spread_bps: float = 25) -> Opportunity:
     """Hard requirements first; only EXECUTE may submit orders."""
     r = []
-    if o.strategy_status not in ("validated",):
+    if o.strategy_status not in ("validated", "experimental"):
         r.append(f"strategy {o.strategy} is {o.strategy_status} (not validated)")
     elif not o.strategy_approved:
         r.append(f"strategy {o.strategy} validated but awaiting owner approval")

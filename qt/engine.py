@@ -264,6 +264,11 @@ class Engine:
             executable = inst.timeframe == "5Min" or (inst.timeframe == "1Day" and self.s.allow_overnight)
             if r["status"] == "validated" and r["approved"] and executable:
                 active.append(r)
+            elif (r["strategy"] in self.s.experimental_strategies and r["status"] in ("shadow", "validated")
+                  and executable):
+                # owner-approved experiment: trades paper although it did not pass validation; a strategy that
+                # research rejects or that forward results suspend drops out automatically
+                active.append(dict(r, status="experimental", approved=1))
             elif r["status"] in ("validated", "shadow"):
                 if r["status"] == "validated" and r["approved"] and not executable:
                     r = dict(r, approved=0)  # approved, but overnight execution is switched off
@@ -276,9 +281,12 @@ class Engine:
         from .strategies.features import daily_panel
         from .universe import DAILY_UNIVERSE
         today = now.astimezone(ET).date()
-        if self.db.kv_get("daily_cycle_done") == today.isoformat():
-            return
         active, shadow = self.active_strategies("1Day")
+        # re-run today if the set of trading daily strategies changed since this morning's run (owner approval)
+        stamp = today.isoformat() + "|" + ",".join(sorted(r["strategy"] for r in active))
+        done = self.db.kv_get("daily_cycle_done")
+        if done == stamp or (done == today.isoformat() and not active):
+            return
         missing = [x for x in DAILY_UNIVERSE if x not in self.daily]
         if missing:
             try:
@@ -340,7 +348,7 @@ class Engine:
                 o.price = float(self.prices.get(o.symbol, o.price))
                 o.spread_bps = self.spreads.get(o.symbol, o.spread_bps)
             self.act(opps, now)
-        self.db.kv_set("daily_cycle_done", today.isoformat())
+        self.db.kv_set("daily_cycle_done", stamp)
 
     def analyze(self, now: dt.datetime) -> list[Opportunity]:
         """Stage 2 on confirmed bars. Returns scored + classified opportunities."""
@@ -424,7 +432,7 @@ class Engine:
         state = self.account_state(now)
         for o in opps:
             gr = None
-            if o.signal and o.strategy_status == "validated" and o.strategy_approved and o.stop:
+            if o.signal and self._may_trade(o) and o.stop:
                 prop = Proposal(o.symbol, "us_equity", o.strategy, o.price, o.stop, o.est_cost_bps, o.spread_bps,
                                 o.data_age_s, o.atr, o.max_corr, o.oos_expectancy_r)
                 d = self.guardian.evaluate(prop, state)
@@ -457,9 +465,10 @@ class Engine:
                 notional=d.notional, entry_ref=ask, stop=o.stop, target=o.target, trail_atr=ep.trail_atr,
                 trail_activate_r=ep.trail_activate_r, breakeven_r=ep.breakeven_r, max_bars=ep.max_bars,
                 flatten_eod=ep.flatten_eod, atr=o.atr, score=o.score, regime=o.regime,
-                thesis=f"{inst.description} | score {o.score}", exit_plan=ep.describe(),
+                thesis=(("EXPERIMENTAL (unvalidated, owner-approved) | " if o.strategy_status == "experimental" else "")
+                        + f"{inst.description} | score {o.score}"), exit_plan=ep.describe(),
                 explanation={"opportunity": o.to_row(), "competing_opportunities": competitors,
-                             "guardian": d.to_dict()}, est_cost_bps=o.est_cost_bps, planned_risk=d.risk_dollars,
+                             "guardian": d.to_dict(), "experimental": o.strategy_status == "experimental"}, est_cost_bps=o.est_cost_bps, planned_risk=d.risk_dollars,
                 timeframe=inst.timeframe)
             if self.tm.open_trade(plan):
                 executed += 1
@@ -473,10 +482,100 @@ class Engine:
                                              "executed": executed, "watchlist": self.watchlist})
         self._shadow(opps, now)
 
+    FORCED = "FORCED_daily_min"
+
+    def force_daily_minimum(self, opps: list[Opportunity], now: dt.datetime, open_: dt.datetime) -> None:
+        """PAPER ONLY. Owner asked for at least one trade per day: when nothing research-backed has traded by
+        FORCE_TRADE_AFTER_MIN after the open, buy the best-ranked opportunity anyway. Every guardian limit still
+        applies, the stop is mandatory, and the position is closed by the end of the day. Tagged FORCED_daily_min."""
+        if self.s.mode != "paper" or self.s.min_daily_trades <= 0 or self.integrity:
+            return
+        if now < open_ + dt.timedelta(minutes=self.s.force_trade_after_min):
+            return
+        today = now.date().isoformat()
+        n = self.db.one("SELECT COUNT(*) n FROM trades WHERE session=?", (today,))["n"]
+        if n >= self.s.min_daily_trades:
+            return
+        L = self.limits
+        held = {t["symbol"] for t in self.tm.active_trades()}
+        cands = [o for o in opps if o.price > 0 and o.atr > 0 and o.symbol not in held
+                 and o.data_age_s <= L.stale_data_seconds and o.spread_bps <= L.max_spread_bps]
+        cands.sort(key=lambda o: (not o.signal, -o.score))
+        if not cands:
+            cands = self._scanner_candidates(now, held)
+        for o in cands[:10]:
+            fallback = o.price - max(3 * o.atr, 0.01 * o.price)
+            stop = o.stop if (o.stop and o.stop < o.price * 0.997 and o.stop > o.price * 0.95) else fallback
+            state = self.account_state(now)
+            prop = Proposal(o.symbol, "us_equity", self.FORCED, o.price, stop, o.est_cost_bps, o.spread_bps,
+                            o.data_age_s, o.atr, o.max_corr, None)
+            d = self.guardian.evaluate(prop, state)
+            if not d.approved:
+                log.info("forced trade candidate %s rejected by guardian: %s", o.symbol, d.reasons)
+                continue
+            asset = self.broker.get_asset(o.symbol)
+            if not asset.get("tradable") or not asset.get("fractionable"):
+                continue
+            q = self.broker.latest_quotes([o.symbol]).get(o.symbol, {})
+            tid = now.strftime("%Y%m%d%H%M%S") + uuid.uuid4().hex[:6]
+            plan = TradePlan(
+                trade_id=tid, symbol=o.symbol, asset_class="us_equity", strategy=self.FORCED, strategy_version="1",
+                notional=d.notional, entry_ref=q.get("ask") or o.price, stop=stop, target=None, trail_atr=2.0,
+                trail_activate_r=1.0, breakeven_r=1.0, max_bars=0, flatten_eod=True, atr=o.atr, score=o.score,
+                regime=o.regime,
+                thesis=(f"FORCED daily-minimum trade (owner request; NOT a validated signal) | best-ranked: "
+                        f"{o.strategy} score {o.score}{' with entry signal' if o.signal else ', no entry signal'}"),
+                exit_plan="stop at entry-%.2f; breakeven at +1R; 2xATR trail from +1R; flat by the close" % (o.price - stop),
+                explanation={"opportunity": o.to_row(), "guardian": d.to_dict(), "forced": True},
+                est_cost_bps=o.est_cost_bps, planned_risk=d.risk_dollars, timeframe="5Min")
+            if self.tm.open_trade(plan):
+                self.db.event("important", "forced_trade",
+                              f"FORCED daily-minimum paper trade: {o.symbol} ${d.notional:.2f}, stop {stop:.2f} "
+                              f"(source {o.strategy}, score {o.score}); not a validated signal")
+                self.notify("trade_open", f"Forced daily-minimum paper trade: {o.symbol} (not a validated signal)")
+            return
+
+    def _scanner_candidates(self, now: dt.datetime, held: set) -> list[Opportunity]:
+        """Fallback for the forced trade when no strategy produced a candidate: the stage-1 scanner's top-ranked
+        liquid names that are moving up from the open, with a fresh quote and 5-minute bars for the ATR stop."""
+        from .indicators import atr as atr_fn
+        top = (self.db.kv_get("stage1") or {}).get("top") or []
+        out = []
+        for row in top:
+            sym = row.get("symbol")
+            if not sym or sym in held or sym == "SPY" or (row.get("from_open_pct") or 0) <= 0:
+                continue
+            bars = self.bars.get(sym)
+            px = self.prices.get(sym)
+            if bars is None or len(bars) < 20 or not px or sym not in self.quote_ts:
+                continue
+            a = float(atr_fn(bars.tail(60)).iloc[-1])
+            if not a or a != a:
+                continue
+            age = (now - self.quote_ts[sym]).total_seconds()
+            spread = self.spreads.get(sym, 99.0)
+            if age > self.limits.stale_data_seconds or spread > self.limits.max_spread_bps:
+                continue
+            adv = row.get("adv")
+            o = Opportunity(symbol=sym, strategy="stage1_scanner", price=float(px),
+                            change_pct=float(row.get("change_pct") or 0), relvol=row.get("relvol_iex"),
+                            momentum=row.get("from_open_pct"), regime="unknown", stop=None, target=None, atr=a,
+                            spread_bps=spread,
+                            est_cost_bps=self.costs.round_trip_bps("us_equity", self.costs.spread_bps("us_equity", adv, sym)),
+                            data_age_s=age, signal=False, strength=0.0, strategy_status="none", strategy_approved=False,
+                            oos_expectancy_r=None, oos_trades=0, holm_p=None, regime_allowed=True, adv=adv)
+            o.score = round(float(row.get("stage1_score") or 0), 2)
+            out.append(o)
+        return out
+
+    @staticmethod
+    def _may_trade(o) -> bool:
+        return o.strategy_status in ("validated", "experimental") and bool(o.strategy_approved)
+
     def _shadow(self, opps, now):
         """Record signals of non-approved strategies as shadow trades (forward test without orders)."""
         for o in opps:
-            if o.signal and not (o.strategy_status == "validated" and o.strategy_approved) and o.stop:
+            if o.signal and not self._may_trade(o) and o.stop:
                 key = f"sh-{o.strategy}-{o.symbol}-{now.astimezone(ET).date()}"
                 if self.db.one("SELECT 1 FROM shadow_trades WHERE trade_id LIKE ?", (key + "%",)):
                     continue
@@ -624,6 +723,8 @@ class Engine:
                     for o in opps:
                         o.signal = False if o.signal else o.signal
                 self.act(opps, now)
+                if not cutoff:
+                    self.force_daily_minimum(opps, now, open_)
         self.tm.manage(self.prices, self.last_closed_bar, now, flatten, market_open=open_ <= now <= close_)
         self.manage_shadow(now, flatten)
         for k in list(self.last_closed_bar):

@@ -185,6 +185,9 @@ def create_app(settings=None, db: DB | None = None) -> FastAPI:
         for r in rows:
             for k in ("oos_metrics", "holdout_metrics", "forward_metrics", "allowed_regimes", "history", "params"):
                 r[k] = _j(r[k])
+            if r["strategy"] in s.experimental_strategies and r["status"] in ("shadow", "validated"):
+                r["status"] = "EXPERIMENTAL (unvalidated) - paper trading"
+                r["approved"] = 1
         shadow = db.query("SELECT strategy, COUNT(*) n, AVG(r_multiple) avg_r FROM shadow_trades WHERE status='closed' "
                           "GROUP BY strategy")
         live = db.query("SELECT strategy, COUNT(*) n, SUM(pnl) pnl, AVG(r_multiple) avg_r FROM trades WHERE "
