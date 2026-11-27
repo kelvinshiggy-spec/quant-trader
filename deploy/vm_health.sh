@@ -45,9 +45,24 @@ for r in c.execute("SELECT ts, level, kind, substr(message, 1, 200) FROM events 
 for r in c.execute("SELECT ts, kind, substr(message, 1, 300) FROM events WHERE kind IN ('dashboard_client', "
                    "'dashboard_selftest') AND ts >= strftime('%Y-%m-%dT%H:%M:%S', 'now', '-2 hours') ORDER BY rowid DESC LIMIT 5"):
     print("dashboard_problem", *r)
-for k in ("daily_cycle_done", "universe_date", "risk_limits"):
+for k in ("daily_cycle_done", "universe_date", "risk_limits", "upcoming_done", "optbook_last"):
     r = c.execute("SELECT v FROM kv WHERE k=?", (k,)).fetchone()
     print("kv", k, r[0] if r else None)
+r = c.execute("SELECT v FROM kv WHERE k='crypto_scan'").fetchone()
+if r:
+    import json as _j
+    cs = _j.loads(r[0])
+    print("crypto_scan", cs.get("at"), "pairs", cs.get("pairs"), "scanned", cs.get("scanned"), "evaluated",
+          cs.get("evaluated"), "signals", len(cs.get("signals", [])))
+try:
+    for r in c.execute("SELECT strategy, engine, status, COUNT(*), round(SUM(COALESCE(pnl, 0)), 2) FROM book_trades "
+                       "GROUP BY strategy, engine, status ORDER BY 4 DESC LIMIT 20"):
+        print("book", *r)
+    for r in c.execute("SELECT contract, status, entry_premium, last_bid, pnl, exit_reason FROM options_trades "
+                       "ORDER BY entry_time DESC LIMIT 5"):
+        print("option", *r)
+except sqlite3.OperationalError:
+    pass
 for r in c.execute("SELECT strategy, status, COUNT(*) FROM opportunities WHERE ts >= date('now') "
                    "GROUP BY strategy, status ORDER BY 3 DESC LIMIT 15"):
     print("opp", *r)
