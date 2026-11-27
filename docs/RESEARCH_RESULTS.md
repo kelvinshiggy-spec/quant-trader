@@ -145,3 +145,48 @@ The losing simulations stop near -10% because the guardian's latched 10% drawdow
 
 See `docs/STATUS.md`. The main ones: the universe contains survivors chosen in 2026; spreads are
 estimated, not measured; one research run on 40 symbols; holdout is 23 months of mostly rising markets.
+
+# Round 2 (run 20261127T012404Z): daily and monthly strategies
+
+Added after round 1 at the owner's request to look beyond intraday. Hypotheses come from published research
+and were fixed before their first run: O time-series momentum (Moskowitz, Ooi & Pedersen 2012), P dual
+momentum (Antonacci 2014), Q turn of the month (Lakonishok & Smidt 1988; McConnell & Xu 2008), R internal
+bar strength reversion, S 52-week-high momentum (George & Hwang 2004). Universe: 16 asset-class ETFs
+(O, P), index ETFs (Q), index + sector ETFs (R), all 54 daily symbols (S). Development period
+2017-01-01..2024-12-31 (longer daily history), same untouched holdout 2025-01-01..2026-11-25, same
+criteria. Holm correction now covers all **42** variants from both rounds, which is stricter for everyone.
+
+**Bug found and fixed in this round.** The first round-2 run showed S_52w_high with an expectancy of
+-50,303 R. Cause: a signal whose next open was already below its stop created a trade with near-zero
+risk. The live guardian rejects such entries, so the backtester now skips them as well (test
+`test_entry_skipped_when_open_gaps_below_stop`). All 42 variants were re-run with the fix. Round-1
+numbers above changed only marginally (E's holdout trade count changed because its dev-period parameter
+choice changed: adx 15 instead of 25).
+
+| Variant | OOS trades | OOS exp R | OOS PF | PF ex top 5% | Holm p (42 tests) | 2x cost exp R | Holdout trades | Holdout exp R | Holdout PF | Decision |
+|---|---|---|---|---|---|---|---|---|---|---|
+| O_tsmom | 155 | 0.778 | 2.37 | 1.15 | 0.456 | 0.742 | 23 | 1.022 | 4.12 | shadow |
+| O_tsmom+regime | 18 | 1.406 | 2.91 | 2.10 | 1.000 | 1.362 | 21 | 1.205 | 5.07 | rejected |
+| P_dual_momentum | 51 | 0.173 | 1.24 | 0.53 | 1.000 | 0.159 | 7 | 2.645 | 5.53 | rejected |
+| P_dual_momentum+regime | 0 | - | - | - | 1.000 | - | 4 | 1.117 | 2.90 | rejected |
+| Q_turn_of_month | 324 | 0.045 | 1.33 | 1.00 | 1.000 | 0.031 | 74 | -0.041 | 1.02 | rejected |
+| Q_turn_of_month+regime | 84 | 0.156 | 1.81 | 1.31 | 0.810 | 0.139 | 63 | -0.080 | 0.86 | shadow |
+| R_ibs_reversion | 1858 | 0.032 | 1.30 | 1.01 | 0.410 | 0.013 | 416 | 0.063 | 1.24 | shadow |
+| R_ibs_reversion+regime | 1179 | 0.023 | 1.18 | 0.91 | 1.000 | 0.004 | 333 | 0.061 | 1.20 | shadow |
+| S_52w_high | 651 | 0.345 | 1.88 | 0.97 | 0.021 | 0.314 | 208 | 0.317 | 1.86 | shadow |
+| S_52w_high+regime | 366 | 0.187 | 1.51 | 0.81 | 0.722 | 0.159 | 208 | 0.317 | 1.86 | shadow |
+
+**Result: still no validated strategy; the bot stays in cash.** What came closest:
+
+* **S_52w_high**: significant after correction (Holm p = 0.021), profitable at 2x costs and in the holdout
+  (PF 1.86), but PF without the top 5% of winners is 0.97 < 1.0. $100 holdout simulation: +0.9%.
+* **M_swing_rsi2**: unchanged; Holm p = 0.041 with 42 tests, same 0.97 robustness failure. $100 holdout: +2.0%.
+* **O_tsmom**: the largest edge (OOS +0.78 R, holdout +1.02 R, PF 4.1 in the holdout) and robust without its
+  top winners (1.15), but only 155 OOS trades in eight years, so it is not significant after correction
+  (Holm p = 0.46). Monthly signals accumulate slowly; forward shadow trades will add evidence.
+* R_ibs_reversion: real but thin (+0.03 R), PF 1.30 just short of 1.3, not significant.
+* Q_turn_of_month: the regime-gated version failed the holdout (PF 0.86).
+
+SPY buy-and-hold returned +25.0% over the holdout. None of these strategies beat it on the $100 account.
+The nightly research job re-tests everything after each close; a strategy that passes trades paper
+automatically (owner opt-in, 2026-11-27).
