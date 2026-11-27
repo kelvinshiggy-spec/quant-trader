@@ -79,7 +79,7 @@ def classify(o: Opportunity, guardian_reasons: list[str] | None = None, stale_li
              max_spread_bps: float = 25) -> Opportunity:
     """Hard requirements first; only EXECUTE may submit orders."""
     r = []
-    if o.strategy_status not in ("validated", "experimental"):
+    if o.strategy_status not in ("validated", "experimental", "promoted"):
         r.append(f"strategy {o.strategy} is {o.strategy_status} (not validated)")
     elif not o.strategy_approved:
         r.append(f"strategy {o.strategy} validated but awaiting owner approval")

@@ -79,9 +79,12 @@ def test_daily_minimum_is_paper_only():
 
 
 def test_forced_trade_falls_back_to_scanner(tmp_path, monkeypatch):
-    e, db = make(tmp_path, monkeypatch, status="rejected", MIN_DAILY_TRADES="1")
+    e, db = make(tmp_path, monkeypatch, status="rejected", MIN_DAILY_TRADES="0")
     e.startup()
-    e.cycle()  # no strategy candidates at all
+    e.cycle()
+    e.s = dataclasses.replace(e.s, min_daily_trades=1)
+    db.execute("DELETE FROM trades")
+    e.tm.ledger = type(e.tm.ledger)(100.0, 'cash')  # no strategy candidates at all
     assert db.one("SELECT COUNT(*) c FROM trades")["c"] == 0
     now = e.clock()
     bars = e.bars["SPY"]
@@ -97,9 +100,12 @@ def test_forced_trade_falls_back_to_scanner(tmp_path, monkeypatch):
 
 
 def test_forced_trade_skips_leveraged_funds(tmp_path, monkeypatch):
-    e, db = make(tmp_path, monkeypatch, status="rejected", MIN_DAILY_TRADES="1")
+    e, db = make(tmp_path, monkeypatch, status="rejected", MIN_DAILY_TRADES="0")
     e.startup()
     e.cycle()
+    e.s = dataclasses.replace(e.s, min_daily_trades=1)
+    db.execute("DELETE FROM trades")
+    e.tm.ledger = type(e.tm.ledger)(100.0, 'cash')
     now = e.clock()
     bars = e.bars["SPY"]
     for sym in ("TQQQ", "QQQ"):

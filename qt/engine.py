@@ -28,6 +28,7 @@ from .broker.base import BrokerError
 from .config import RiskLimits, Settings, check_within_ceiling, load_settings
 from .costs import CostModel
 from .data.historical import HistoricalData, to_rth
+from .books import Books
 from .db import DB
 from .execution import TradeManager, TradePlan
 from .guardian import AccountState, CapitalGuardian, Proposal
@@ -63,6 +64,8 @@ class Engine:
         self.tm = TradeManager(self.broker, self.db, ledger, self.notify, clock=clock)
         self.guardian = CapitalGuardian(self.limits)
         self.costs = CostModel()
+        self.books = Books(self.db, self.limits, settings.account_type, self.costs)
+        self._book_only: dict[str, list[dict]] = {}
         self.marks = self.db.kv_get("marks", {})
         self.bars: dict[str, pd.DataFrame] = {}
         self.daily: dict[str, pd.DataFrame] = {}
@@ -249,7 +252,8 @@ class Engine:
         """(active, shadow). Daily (overnight) strategies can only be ACTIVE when ALLOW_OVERNIGHT_HOLDS
         is set by the owner; hourly crypto needs ALLOW_CRYPTO_EXECUTION and is not wired to execution yet."""
         rows = self.db.query("SELECT * FROM strategy_status")
-        active, shadow = [], []
+        fwd = self.db.kv_get("forward_status", {}) or {}
+        active, shadow, book_only = [], [], []
         for r in rows:
             base = r["strategy"].split("+")[0]
             cls = BY_NAME.get(base)
@@ -262,7 +266,16 @@ class Engine:
             r["_oos"] = json.loads(r["oos_metrics"] or "{}")
             r["_allowed"] = set(json.loads(r["allowed_regimes"])) if r["allowed_regimes"] else None
             executable = inst.timeframe == "5Min" or (inst.timeframe == "1Day" and self.s.allow_overnight)
-            if r["status"] == "validated" and r["approved"] and executable:
+            fs = fwd.get(r["strategy"], {}).get("status")
+            if fs == "demoted" and r["status"] != "rejected":
+                # forward test failed (pre-registered rule in qt/books.py): keeps running in its book only
+                book_only.append(dict(r, status="demoted", approved=0))
+            elif fs == "promoted" and executable and r["status"] != "suspended":
+                # forward-validated: its expectancy for sizing/gating comes from forward trades, not research
+                active.append(dict(r, status="promoted", approved=1,
+                                   _oos={**r["_oos"], "expectancy_r": fwd[r["strategy"]].get("mean_r") or 0.1,
+                                         "holm_p": fwd[r["strategy"]].get("holm_p") or 0.05}))
+            elif r["status"] == "validated" and r["approved"] and executable:
                 active.append(r)
             elif (r["strategy"] in self.s.experimental_strategies and r["status"] in ("shadow", "validated")
                   and executable):
@@ -273,6 +286,9 @@ class Engine:
                 if r["status"] == "validated" and r["approved"] and not executable:
                     r = dict(r, approved=0)  # approved, but overnight execution is switched off
                 shadow.append(r)
+            else:
+                book_only.append(r)  # rejected / suspended: forward-tested in its own book, never traded
+        self._book_only[timeframe] = book_only
         return active, shadow
 
     def daily_cycle(self, now: dt.datetime) -> None:
@@ -311,7 +327,8 @@ class Engine:
         reg_c = coarse(regime_label)
         held = {t["symbol"]: t for t in self.tm.active_trades()}
         opps = []
-        for r in active + shadow:
+        book_open = {(t["strategy"], t["symbol"]): t for t in self.books.open_trades()}
+        for r in active + shadow + self._book_only.get("1Day", []):
             inst = r["_inst"]
             for sym, f in feats.items():
                 in_wide = sym in wide_set and r["strategy"].split("+")[0] in self.s.swing_wide_strategies
@@ -319,6 +336,11 @@ class Engine:
                     continue
                 sig = inst.signals(f).iloc[-1]
                 last = f.iloc[-1]
+                bt = book_open.get((r["strategy"], sym))
+                if bt:
+                    held_days = len(pd.bdate_range(bt["entry_time"][:10], today)) - 1
+                    self.books.daily_update(r["strategy"], sym, float(last["close"]), float(last["atr"]),
+                                            bool(sig["exit_sig"]), held_days, now, self.prices)
                 t = held.get(sym)
                 if t and t["strategy"] == r["strategy"]:
                     ep = inst.exit_plan()
@@ -357,12 +379,13 @@ class Engine:
                 o.price = float(self.prices.get(o.symbol, o.price))
                 o.spread_bps = self.spreads.get(o.symbol, o.spread_bps)
             self.act(opps, now)
+            self.feed_books(opps, now, "swing")
         self.db.kv_set("daily_cycle_done", stamp)
 
     def analyze(self, now: dt.datetime) -> list[Opportunity]:
         """Stage 2 on confirmed bars. Returns scored + classified opportunities."""
         active, shadow = self.active_strategies()
-        strategies = active + shadow
+        strategies = active + shadow + self._book_only.get("5Min", [])
         regime_label = "unknown"
         if self.regimes is not None:
             regime_label = describe_current(self.regimes, now.astimezone(ET).date())["label"]
@@ -583,14 +606,27 @@ class Engine:
             out.append(o)
         return out
 
+    def feed_books(self, opps: list[Opportunity], now: dt.datetime, engine: str) -> None:
+        """Every signal of every strategy goes to that strategy's own simulated $100 book (forward test)."""
+        for o in opps:
+            if not o.signal or "+" in o.strategy or not o.stop:
+                continue  # books track base strategies; regime-gated variants are research-only
+            cls = BY_NAME.get(o.strategy)
+            if cls is None:
+                continue
+            try:
+                self.books.consider(o, cls().exit_plan(), engine, now, self.prices, BAR_MIN)
+            except Exception:  # noqa: BLE001
+                log.exception("book entry failed for %s %s", o.strategy, o.symbol)
+
     @staticmethod
     def _may_trade(o) -> bool:
-        return o.strategy_status in ("validated", "experimental") and bool(o.strategy_approved)
+        return o.strategy_status in ("validated", "experimental", "promoted") and bool(o.strategy_approved)
 
     def _shadow(self, opps, now):
         """Record signals of non-approved strategies as shadow trades (forward test without orders)."""
         for o in opps:
-            if o.signal and not self._may_trade(o) and o.stop:
+            if o.signal and not self._may_trade(o) and o.stop and o.strategy_status in ("validated", "shadow"):
                 key = f"sh-{o.strategy}-{o.symbol}-{now.astimezone(ET).date()}"
                 if self.db.one("SELECT 1 FROM shadow_trades WHERE trade_id LIKE ?", (key + "%",)):
                     continue
@@ -697,7 +733,8 @@ class Engine:
             self.reconcile()
             self.last_recon = time.monotonic()
         shadow_syms = [r["symbol"] for r in self.db.query("SELECT DISTINCT symbol FROM shadow_trades WHERE status='open'")]
-        self.refresh_quotes(list(dict.fromkeys(held + self.watchlist + shadow_syms)) if sess else held)
+        book_syms = sorted(self.books.symbols())
+        self.refresh_quotes(list(dict.fromkeys(held + self.watchlist + shadow_syms + book_syms)) if sess else held)
         self.update_marks(now)
         # stale-data protection for held symbols
         for s in held:
@@ -716,6 +753,13 @@ class Engine:
             self._equity_snapshot(now)
             if now > close_ and self.report_done != today.isoformat():
                 self.daily_report(today)
+            if now > close_ and self.db.kv_get("books_evaluated") != today.isoformat():
+                try:
+                    self.books.evaluate(now)
+                    self.upcoming_signals(today)
+                except Exception:  # noqa: BLE001
+                    log.exception("end-of-day book evaluation failed")
+                self.db.kv_set("books_evaluated", today.isoformat())
             self.publish_status(now)
             return
         self.ensure_daily(today)
@@ -739,9 +783,15 @@ class Engine:
                         o.signal = False if o.signal else o.signal
                 self.act(opps, now)
                 if not cutoff:
+                    self.feed_books(opps, now, "day")
                     self.force_daily_minimum(opps, now, open_)
         self.tm.manage(self.prices, self.last_closed_bar, now, flatten, market_open=open_ <= now <= close_)
         self.manage_shadow(now, flatten)
+        if open_ <= now <= close_:
+            try:
+                self.books.manage(self.prices, self.last_closed_bar, now, flatten, self.spreads)
+            except Exception:  # noqa: BLE001
+                log.exception("book management failed")
         for k in list(self.last_closed_bar):
             self.last_closed_bar[k]["exit_sig"] = False
         self._equity_snapshot(now)
