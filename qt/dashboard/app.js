@@ -12,11 +12,15 @@ async function api(path, opts = {}) {
     headers: {"Content-Type": "application/json", "X-Requested-With": "quant-trader", ...(opts.headers || {})}});
   if (r.status === 401) { showLogin(); throw new Error("auth"); }
   const body = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(body.detail || r.statusText);
+  if (!r.ok) throw new Error(`${body.detail || r.statusText || "request failed"} (HTTP ${r.status} on ${path})`);
   return body;
 }
 function showLogin() { $("#login").classList.remove("hidden"); $("#app").classList.add("hidden"); }
-function showApp() { $("#login").classList.add("hidden"); $("#app").classList.remove("hidden"); }
+function showApp() {
+  $("#login").classList.add("hidden"); $("#app").classList.remove("hidden");
+  if (document.activeElement && document.activeElement.blur) document.activeElement.blur();  // closes the phone keyboard
+  window.scrollTo(0, 0);  // the login form may have left the page scrolled past the top
+}
 
 $("#loginForm").addEventListener("submit", async (e) => {
   e.preventDefault();
@@ -214,7 +218,35 @@ async function sendCmd(command, args, phrase) {
 
 const renderers = {overview: renderOverview, scanner: renderScanner, positions: renderPositions, guardian: renderGuardian,
   tournament: renderTournament, research: renderResearch, trades: renderTrades, reports: renderReports, system: renderSystem, control: renderControl};
-async function refresh() { try { await renderers[current](); if (current !== "system") renderSystemDot(); } catch (e) { if (e.message !== "auth") console.warn(e); } }
+// A tab that fails to load shows the reason instead of a blank page, and keeps retrying every 15 seconds.
+const reported = new Set();
+function reportProblem(tab, message) {  // tell the server, so a broken dashboard shows up in the health report
+  const key = tab + ":" + message; if (reported.has(key)) return; reported.add(key);
+  fetch("/api/client_error", {method: "POST", credentials: "same-origin",
+    headers: {"Content-Type": "application/json", "X-Requested-With": "quant-trader"},
+    body: JSON.stringify({tab, message: String(message).slice(0, 400)})}).catch(() => {});
+}
+function showTabError(tab, e) {
+  const el = $("#" + tab); if (!el) return;
+  reportProblem(tab, e && e.message ? e.message : e);
+  el.innerHTML = `<div class="card"><h2>This section could not load</h2><p class="neg">${esc(e && e.message ? e.message : e)}</p>
+    <p class="muted small">Retrying automatically every 15 seconds. Other tabs may still work.</p>
+    <div class="row"><button class="btn" id="retryTab">Retry now</button></div></div>`;
+  const b = $("#retryTab"); if (b) b.onclick = () => refresh();
+}
+async function refresh() {
+  const tab = current;
+  try {
+    await renderers[tab](); if (tab !== "system") renderSystemDot();
+    const el = $("#" + tab);  // rendered but nothing visible = the "blank screen" case: report it
+    if (tab === current && el && !$("#app").classList.contains("hidden") && el.getBoundingClientRect().height < 40) reportProblem(tab, "tab rendered blank");
+  }
+  catch (e) { if (e.message !== "auth") { console.warn(e); showTabError(tab, e); } }
+}
+window.addEventListener("error", (ev) => { if (!$("#app").classList.contains("hidden")) showTabError(current, ev.error || ev.message); });
+window.addEventListener("unhandledrejection", (ev) => { if (!$("#app").classList.contains("hidden") && ev.reason?.message !== "auth") showTabError(current, ev.reason); });
 async function renderSystemDot() { try { const h = await fetch("/api/health"); $("#botStatus").className = "dot " + (h.ok ? "ok" : "bad"); } catch (e) {} }
 setInterval(() => { if (!$("#app").classList.contains("hidden") && current !== "control" && $("#modal").classList.contains("hidden")) refresh(); }, 15000);
-api("/api/overview").then(() => { showApp(); refresh(); }).catch(() => showLogin());
+// signed in already -> open the app; a server error (not a sign-in problem) opens the app with the error shown
+api("/api/overview").then(() => { showApp(); refresh(); })
+  .catch((e) => { if (e.message === "auth") return; showApp(); showTabError(current, e); });

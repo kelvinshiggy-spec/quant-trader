@@ -296,6 +296,21 @@ def create_app(settings=None, db: DB | None = None) -> FastAPI:
     def command_status(cid: int, user=Depends(auth)):
         return db.one("SELECT * FROM commands WHERE id=?", (cid,)) or {}
 
+    client_reports: list[float] = []
+
+    @app.post("/api/client_error")
+    async def client_error(request: Request, user=Depends(auth), _=Depends(csrf)):
+        """The dashboard reports script errors and blank tabs seen on the owner's device (shown on System tab)."""
+        now = time.time()
+        client_reports[:] = [t for t in client_reports if now - t < 3600]
+        if len(client_reports) >= 30:  # at most 30 reports an hour
+            return {"ok": False}
+        client_reports.append(now)
+        body = await request.json()
+        ua = request.headers.get("user-agent", "")[:160]
+        db.event("warning", "dashboard_client", f"{str(body.get('message', ''))[:400]} | tab={str(body.get('tab', ''))[:20]} | {ua}")
+        return {"ok": True}
+
     # ---------------- static dashboard ----------------
     @app.get("/", response_class=HTMLResponse)
     def index():

@@ -8,17 +8,30 @@ BUCKET="gs://$(cat /etc/qt-bucket 2>/dev/null)"
 cd "$APP/repo" || exit 0
 DOMAIN=$(grep -E '^DASHBOARD_DOMAIN=' "$APP/.env" | cut -d= -f2-)
 OUT=$(mktemp)
+# dashboard self-test: signs in like a browser and loads every tab's data; a failure means a blank/broken tab.
+# On failure the api container is restarted once and the test repeated; failures are logged as events.
+SELFTEST=$(docker compose exec -T api python -m qt.api.selftest --record 2>&1)
+if ! echo "$SELFTEST" | grep -q "dashboard_selftest: OK"; then
+  docker compose restart api >/dev/null 2>&1 || true
+  for _ in $(seq 1 12); do sleep 10; curl -s -m 5 -o /dev/null http://127.0.0.1:8080/api/health && break; done
+  SELFTEST="$SELFTEST
+after restarting api:
+$(docker compose exec -T api python -m qt.api.selftest --record 2>&1)"
+fi
 {
   echo "time_utc: $(date -u +%FT%TZ)"
   echo "release: $(cat "$APP/release.txt" 2>/dev/null)"
   echo "uptime: $(uptime -p)"
   echo "dashboard: https://$DOMAIN"
+  echo "$SELFTEST" | grep "dashboard_selftest:" | tail -1
   echo "--- containers"
   docker compose ps -a --format '{{.Name}} {{.State}} {{.Health}} {{.Status}}'
   echo "--- api /api/health (local)"
   curl -s -m 10 http://127.0.0.1:8080/api/health; echo
   echo "--- dashboard over public HTTPS"
   curl -s -m 15 -o /dev/null -w 'http=%{http_code} tls_verify=%{ssl_verify_result}\n' "https://$DOMAIN/api/health"
+  echo "--- dashboard self-test (details)"
+  echo "$SELFTEST"
   echo "--- heartbeats and recent events (database)"
   docker compose exec -T api python - <<'PY' 2>&1 | tail -40
 import sqlite3
@@ -27,6 +40,9 @@ for r in c.execute("SELECT component, ts, status FROM heartbeats"):
     print("hb", *r)
 for r in c.execute("SELECT ts, level, kind, substr(message, 1, 200) FROM events ORDER BY rowid DESC LIMIT 20"):
     print("ev", *r)
+for r in c.execute("SELECT ts, kind, substr(message, 1, 300) FROM events WHERE kind IN ('dashboard_client', "
+                   "'dashboard_selftest') AND ts >= strftime('%Y-%m-%dT%H:%M:%S', 'now', '-2 hours') ORDER BY rowid DESC LIMIT 5"):
+    print("dashboard_problem", *r)
 for k in ("daily_cycle_done", "universe_date", "risk_limits"):
     r = c.execute("SELECT v FROM kv WHERE k=?", (k,)).fetchone()
     print("kv", k, r[0] if r else None)

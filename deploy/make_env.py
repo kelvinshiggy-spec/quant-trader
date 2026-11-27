@@ -16,6 +16,19 @@ import sys
 import bcrypt
 
 
+def _password_hash(pw: str, prev_hash: str, change: bool) -> str:
+    """The dashboard password survives redeploys. A redeploy from a session whose DASHBOARD_PASSWORD is out of date
+    (env settings changed after the session started) used to silently reset the owner's password and lock them
+    out, so the server's current hash is kept unless the change is asked for with CHANGE_DASHBOARD_PASSWORD=1."""
+    if prev_hash and bcrypt.checkpw(pw.encode(), prev_hash.encode()):
+        return prev_hash
+    if prev_hash and not change:
+        print("NOTE: DASHBOARD_PASSWORD here differs from the server's; keeping the server's password. "
+              "Set CHANGE_DASHBOARD_PASSWORD=1 to change it.", file=sys.stderr)
+        return prev_hash
+    return bcrypt.hashpw(pw.encode(), bcrypt.gensalt(12)).decode()
+
+
 def _ceiling(env: dict) -> str:
     import json
     from qt.config import RiskLimits
@@ -57,8 +70,7 @@ def build(env: dict, overnight: bool, auto_approve: bool, experimental: str = ""
         "QT_RISK_CEILING_JSON": _ceiling(env),
         "DASHBOARD_DOMAIN": "auto",  # replaced on the server with <ip-with-dashes>.sslip.io
         "DASHBOARD_USER": env.get("DASHBOARD_USER", "admin"),
-        "DASHBOARD_PASSWORD_HASH": (prev_hash if prev_hash and bcrypt.checkpw(pw.encode(), prev_hash.encode())
-                                    else bcrypt.hashpw(pw.encode(), bcrypt.gensalt(12)).decode()),
+        "DASHBOARD_PASSWORD_HASH": _password_hash(pw, prev_hash, env.get("CHANGE_DASHBOARD_PASSWORD") == "1"),
         "SESSION_SECRET": prev.get("SESSION_SECRET") or secrets.token_hex(32),
         "NOTIFY_LEVEL": env.get("NOTIFY_LEVEL", "important"),
         "TELEGRAM_BOT_TOKEN": env.get("TELEGRAM_BOT_TOKEN", ""),
