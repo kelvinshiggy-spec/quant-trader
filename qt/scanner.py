@@ -36,6 +36,7 @@ def build_discovery_universe(broker, hist, min_adv: float = 5e7, min_price: floa
     assets = [a for a in broker.list_assets("us_equity")
               if a["tradable"] and a["fractionable"] and a["exchange"] in ALLOWED_EXCHANGES
               and a["symbol"].isalpha()]
+    names = {a["symbol"]: a.get("name", "") for a in assets}
     syms = [a["symbol"] for a in assets]
     end = dt.date.today()
     start = end - dt.timedelta(days=45)
@@ -53,7 +54,8 @@ def build_discovery_universe(broker, hist, min_adv: float = 5e7, min_price: floa
             adv = float((d["close"] * d["volume"]).tail(20).mean())
             px = float(d["close"].iloc[-1])
             if adv >= min_adv and px >= min_price:
-                out.append({"symbol": s, "adv": adv, "price": px})
+                out.append({"symbol": s, "adv": adv, "price": px, "name": names.get(s, ""),
+                            "leveraged": is_leveraged_or_inverse(s, names.get(s, ""))})
     out.sort(key=lambda x: -x["adv"])
     return out[:max_symbols]
 

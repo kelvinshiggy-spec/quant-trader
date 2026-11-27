@@ -106,6 +106,10 @@ class Settings:
     # take the best-ranked opportunity anyway (stop, guardian limits, $100 budget, flattened by the close).
     # Recorded under strategy "FORCED_daily_min" so it never mixes with research-backed statistics.
     min_daily_trades: int = 0
+    # swing strategies that also scan the N most liquid discovered stocks (beyond the research universe);
+    # tested out-of-universe on 297 liquid stocks 2017-2026 (2026-11-27). 0 = research universe only.
+    swing_wide_n: int = 0
+    swing_wide_strategies: tuple = ("E_trend_following", "S_52w_high", "M_swing_rsi2")
     force_trade_after_min: int = 45
     notify_level: str = "important"  # all | important | daily | off
     telegram_token: str = ""
@@ -199,6 +203,7 @@ def load_settings(env: dict | None = None, require_credentials: bool = True) -> 
         allow_crypto=_bool(env.get("ALLOW_CRYPTO_EXECUTION"), False),
         allow_overnight=_bool(env.get("ALLOW_OVERNIGHT_HOLDS"), False),
         auto_approve_validated=_bool(env.get("AUTO_APPROVE_VALIDATED"), False),
+        swing_wide_n=int(env.get("SWING_WIDE_UNIVERSE", "0") or 0),
         min_daily_trades=int(env.get("MIN_DAILY_TRADES", "0") or 0) if mode == "paper" else 0,
         force_trade_after_min=int(env.get("FORCE_TRADE_AFTER_MIN", "45") or 45),
         experimental_strategies=tuple(x.strip() for x in env.get("EXPERIMENTAL_STRATEGIES", "").split(",") if x.strip()),

@@ -287,7 +287,12 @@ class Engine:
         done = self.db.kv_get("daily_cycle_done")
         if done == stamp or (done == today.isoformat() and not active):
             return
-        missing = [x for x in DAILY_UNIVERSE if x not in self.daily]
+        wide = [u["symbol"] for u in self.universe
+                if u.get("adv") and not u.get("leveraged") and not is_leveraged_or_inverse(u["symbol"], u.get("name", ""))
+                and u["symbol"] not in DAILY_UNIVERSE][:self.s.swing_wide_n] if self.s.swing_wide_n > 0 else []
+        scan = list(DAILY_UNIVERSE) + wide
+        wide_set = set(wide)
+        missing = [x for x in scan if x not in self.daily]
         if missing:
             try:
                 self.daily.update(self.hist._fetch(missing, "1Day", today - dt.timedelta(days=560),
@@ -296,7 +301,7 @@ class Engine:
                 log.warning("daily universe fetch failed: %s", e)
         confirmed = {}
         for sym, d in self.daily.items():
-            if sym in DAILY_UNIVERSE and len(d) > 210:
+            if sym in scan and len(d) > 210:
                 confirmed[sym] = d[d.index.tz_convert(ET).date < today]  # confirmed bars only
         feats = daily_panel(confirmed, min_len=210)
         regime_label = describe_current(self.regimes, today)["label"] if self.regimes is not None else "unknown"
@@ -306,7 +311,8 @@ class Engine:
         for r in active + shadow:
             inst = r["_inst"]
             for sym, f in feats.items():
-                if inst.universe and sym not in inst.universe:
+                in_wide = sym in wide_set and r["strategy"].split("+")[0] in self.s.swing_wide_strategies
+                if inst.universe and sym not in inst.universe and not in_wide:
                     continue
                 sig = inst.signals(f).iloc[-1]
                 last = f.iloc[-1]
@@ -453,6 +459,9 @@ class Engine:
             asset = self.broker.get_asset(o.symbol)
             if not asset.get("tradable") or not asset.get("fractionable"):
                 o.status, o.reasons = "REJECT", ["asset not tradable/fractionable at Alpaca"]
+                continue
+            if is_leveraged_or_inverse(o.symbol, asset.get("name", "")):
+                o.status, o.reasons = "REJECT", ["leveraged/inverse fund (excluded by owner)"]
                 continue
             q = self.broker.latest_quotes([o.symbol]).get(o.symbol, {})
             ask = q.get("ask") or o.price
