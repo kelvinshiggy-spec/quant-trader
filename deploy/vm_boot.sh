@@ -45,6 +45,7 @@ cat > /etc/systemd/system/qt-health.service <<EOF
 Description=quant-trader health report and release check
 [Service]
 Type=oneshot
+Environment=HOME=/root
 ExecStart=/usr/local/bin/qt-health
 EOF
 cat > /etc/systemd/system/qt-health.timer <<EOF

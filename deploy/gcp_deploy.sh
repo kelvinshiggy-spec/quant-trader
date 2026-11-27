@@ -58,6 +58,11 @@ retry() { for i in 1 2 3 4 5 6; do "$@" && return 0; sleep $((i * 5)); done; ret
 retry $G storage buckets add-iam-policy-binding "gs://$BUCKET" --member="serviceAccount:$SA" \
   --role=roles/storage.objectAdmin >/dev/null
 
+step "VM log/metric writer roles (lets the server's logs reach Cloud Logging for remote diagnosis; free tier)"
+for role in roles/logging.logWriter roles/monitoring.metricWriter; do
+  retry $G projects add-iam-policy-binding "$PROJECT" --member="serviceAccount:$SA" --role="$role" --condition=None >/dev/null
+done
+
 step "secret qt-env"
 $G secrets describe qt-env >/dev/null 2>&1 || $G secrets create qt-env --replication-policy=automatic >/dev/null
 $G secrets versions add qt-env --data-file="$ENV_FILE" >/dev/null
