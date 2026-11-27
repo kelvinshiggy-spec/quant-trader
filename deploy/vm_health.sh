@@ -47,6 +47,12 @@ rm -f "$OUT"
 
 # self-update: a new release pointer -> re-run the boot script (idempotent; the engine reconciles on restart)
 NEW=$(gcloud storage cat "$BUCKET/release.txt" 2>/dev/null || true)
-if [ -n "$NEW" ] && [ "$NEW" != "$(cat "$APP/release.txt" 2>/dev/null)" ]; then
+# a settings-only change (new .env in Secret Manager, same code) must be applied too
+PROJECT=$(curl -s -m 5 -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/project/project-id)
+NEWENV=$(gcloud secrets versions access latest --secret=qt-env --project="$PROJECT" 2>/dev/null \
+  | sed "s/^DASHBOARD_DOMAIN=auto\$/DASHBOARD_DOMAIN=$DOMAIN/" || true)
+ENV_CHANGED=0
+if [ -n "$NEWENV" ] && [ "$NEWENV" != "$(cat "$APP/.env")" ]; then ENV_CHANGED=1; fi
+if { [ -n "$NEW" ] && [ "$NEW" != "$(cat "$APP/release.txt" 2>/dev/null)" ]; } || [ "$ENV_CHANGED" = 1 ]; then
   google_metadata_script_runner startup >/var/log/qt-update.log 2>&1 || true
 fi
