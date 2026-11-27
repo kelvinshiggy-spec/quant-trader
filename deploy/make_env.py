@@ -16,6 +16,15 @@ import sys
 import bcrypt
 
 
+def _ceiling(env: dict) -> str:
+    import json
+    from qt.config import RiskLimits
+    lim = RiskLimits()
+    if env.get("MAX_POSITIONS"):
+        lim.max_positions = int(env["MAX_POSITIONS"])  # 2026-11-27: owner approved 8 (per-trade risk unchanged)
+    return json.dumps(lim.to_dict(), separators=(",", ":"))
+
+
 def build(env: dict, overnight: bool, auto_approve: bool, experimental: str = "", min_daily_trades: int = 0) -> str:
     key, sec, pw = env.get("ALPACA_PAPER_API_KEY", ""), env.get("ALPACA_PAPER_API_SECRET", ""), env.get("DASHBOARD_PASSWORD", "")
     missing = [n for n, v in (("ALPACA_PAPER_API_KEY", key), ("ALPACA_PAPER_API_SECRET", sec),
@@ -38,6 +47,8 @@ def build(env: dict, overnight: bool, auto_approve: bool, experimental: str = ""
         "EXPERIMENTAL_STRATEGIES": experimental,   # owner-approved, unvalidated, paper only
         "MIN_DAILY_TRADES": str(min_daily_trades),  # paper only; ignored in live mode
         "SWING_WIDE_UNIVERSE": env.get("SWING_WIDE_UNIVERSE", "0"),
+        # owner-approved risk ceiling; only fields the owner changed differ from the spec defaults
+        "QT_RISK_CEILING_JSON": _ceiling(env),
         "DASHBOARD_DOMAIN": "auto",  # replaced on the server with <ip-with-dashes>.sslip.io
         "DASHBOARD_USER": env.get("DASHBOARD_USER", "admin"),
         "DASHBOARD_PASSWORD_HASH": bcrypt.hashpw(pw.encode(), bcrypt.gensalt(12)).decode(),

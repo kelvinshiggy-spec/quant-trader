@@ -27,7 +27,7 @@ for r in c.execute("SELECT component, ts, status FROM heartbeats"):
     print("hb", *r)
 for r in c.execute("SELECT ts, level, kind, substr(message, 1, 200) FROM events ORDER BY rowid DESC LIMIT 20"):
     print("ev", *r)
-for k in ("daily_cycle_done", "universe_date"):
+for k in ("daily_cycle_done", "universe_date", "risk_limits"):
     r = c.execute("SELECT v FROM kv WHERE k=?", (k,)).fetchone()
     print("kv", k, r[0] if r else None)
 for r in c.execute("SELECT strategy, status, COUNT(*) FROM opportunities WHERE ts >= date('now') "
