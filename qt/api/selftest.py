@@ -22,7 +22,7 @@ from itsdangerous import TimestampSigner
 BASE = os.environ.get("QT_SELFTEST_BASE", "http://127.0.0.1:8080")
 PAGES = ["/", "/app.js", "/style.css"]
 DATA = ["/api/overview", "/api/scanner", "/api/positions", "/api/guardian", "/api/tournament", "/api/research",
-        "/api/trades", "/api/reports", "/api/system"]
+        "/api/trades", "/api/reports", "/api/system", "/api/books"]
 # fields the Overview tab (the first thing shown after sign-in) reads directly
 OVERVIEW_KEYS = ["mode", "data_label", "now_pt", "starting_capital", "equity", "equity_curve", "schedule_pt"]
 

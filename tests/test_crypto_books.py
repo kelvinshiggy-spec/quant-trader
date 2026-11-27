@@ -68,3 +68,17 @@ def test_crypto_book_trades_on_weekend(tmp_path, monkeypatch):
     e.cycle()
     bt = db.one("SELECT * FROM book_trades WHERE strategy='Z_crypto' AND status='closed'")
     assert bt and bt["exit_reason"] == "stop" and bt["r"] < -1.0
+    # dashboard: every strategy listed with its own book; scanner shows market status and crypto scan
+    from fastapi.testclient import TestClient
+    from qt.api.app import create_app
+    e._books_published = -1e9
+    e.publish_status(t[0])
+    c = TestClient(create_app(s, db))
+    c.post("/api/login", json={"username": "admin", "password": "correct horse battery"})
+    bk = c.get("/api/books").json()
+    row = {r["strategy"]: r for r in bk["strategies"]}["Z_crypto"]
+    assert row["engine"] == "crypto" and row["closed_trades"] == 1 and row["equity"] < 100 and not row["real_paper_orders"]
+    assert any(r["engine"] == "swing" for r in bk["strategies"]) and bk["closed"][0]["exit_reason"] == "stop"
+    sc = c.get("/api/scanner").json()
+    assert sc["market"]["crypto"] == "open 24/7" and sc["crypto"]["evaluated"] >= 1
+    assert "rejection_reasons" in sc and "upcoming" in sc

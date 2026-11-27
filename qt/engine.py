@@ -75,6 +75,7 @@ class Engine:
         self._crypto_hour = None
         self._crypto_universe: list = []
         self._crypto_universe_date = None
+        self._books_published = -1e9
         self.daily_date: dt.date | None = None
         self.regimes: pd.DataFrame | None = None
         self.watchlist: list[str] = self.db.kv_get("watchlist", default_universe()[:20])
@@ -987,6 +988,40 @@ class Engine:
                                 "integrity": dict(self.integrity, **self.tm.om.integrity_issues),
                                 "broker_failures": self.broker_failures,
                                 "quote_age_s": {s: (now - self.quote_ts[s]).total_seconds() for s in self.quote_ts}})
+        if time.monotonic() - self._books_published > 60:
+            self._books_published = time.monotonic()
+            try:
+                self.publish_books(now)
+            except Exception:  # noqa: BLE001
+                log.exception("book publish failed")
+
+    ENGINE_OF = {"5Min": "day", "1Day": "swing", "1Hour": "crypto"}
+
+    def publish_books(self, now):
+        """Per-strategy $100 book standings for the dashboard (every strategy listed, even before its first trade)."""
+        stats = {r["strategy"]: r for r in self.books.stats(self.prices)}
+        status = {r["strategy"]: r for r in self.db.query("SELECT strategy, status, approved, holdout_metrics "
+                                                           "FROM strategy_status")}
+        fwd = self.db.kv_get("forward_status", {}) or {}
+        rows = []
+        for name, cls in sorted(BY_NAME.items()):
+            inst = cls()
+            r = stats.get(name) or {"strategy": name, "equity": 100.0, "return_pct": 0.0, "realized": 0.0, "fees": 0.0,
+                                    "closed_trades": 0, "open_trades": 0, "win_rate": None, "mean_r": None,
+                                    "profit_factor": None, "max_dd_pct": 0.0, "p_value": None, "since": None}
+            st = status.get(name) or {}
+            hold = json.loads(st.get("holdout_metrics") or "{}") if st else {}
+            trading = (fwd.get(name, {}).get("status") == "promoted" or st.get("status") == "validated" and st.get("approved")
+                       or name in self.s.experimental_strategies and st.get("status") in ("shadow", "validated"))
+            rows.append(dict(r, engine=self.ENGINE_OF.get(inst.timeframe, inst.timeframe), timeframe=inst.timeframe,
+                             asset_class=inst.asset_class, description=inst.description,
+                             research_status=st.get("status", "not researched"),
+                             forward=fwd.get(name, {}).get("status", "testing"), forward_why=fwd.get(name, {}).get("why"),
+                             real_paper_orders=bool(trading and inst.timeframe != "1Hour"),
+                             holdout_mean_r=hold.get("expectancy_r"), holdout_trades=hold.get("trades")))
+        opens = self.books.open_trades()
+        self.db.kv_set("books", {"at": now.isoformat(), "strategies": rows,
+                                 "prices": {t["symbol"]: self.prices.get(t["symbol"]) for t in opens}})
 
     def stage1(self, now, open_, close_):
         try:

@@ -279,7 +279,7 @@ class Books:
                 "closed_trades": int(len(r)), "open_trades": len(self.open_trades(name)),
                 "win_rate": round(float((r > 0).mean()) * 100, 1) if len(r) else None,
                 "mean_r": round(float(r.mean()), 3) if len(r) else None,
-                "profit_factor": round(float(wins / losses), 2) if losses > 0 else (None if not len(r) else float("inf")),
+                "profit_factor": round(float(wins / losses), 2) if losses > 0 else (None if not len(r) else 99.0),  # 99 = no losers
                 "max_dd_pct": round(st["marks"].get("max_dd_pct", 0.0), 2), "p_value": round(_bootstrap_p(r), 4) if len(r) >= 2 else None,
                 "since": st.get("created")})
         return out

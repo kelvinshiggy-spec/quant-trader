@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import re
 import time
 from pathlib import Path
 
@@ -19,7 +20,7 @@ from itsdangerous import BadSignature, SignatureExpired, TimestampSigner
 
 from ..config import RiskLimits, check_within_ceiling, load_settings
 from ..db import DB
-from ..markettime import ET, fmt_pt, now_utc, pt_schedule_for
+from ..markettime import ET, fmt_pt, next_trading_day, now_utc, pt_schedule_for, session, to_pt
 
 SESSION_COOKIE = "qt_session"
 SESSION_MAX_AGE = 12 * 3600
@@ -157,8 +158,54 @@ def create_app(settings=None, db: DB | None = None) -> FastAPI:
                             "WHEN 'WATCH' THEN 1 ELSE 2 END, score DESC LIMIT 300", (last["ts"],))
         for r in rows:
             r["detail"] = _j(r["detail"])
+        reasons: dict[str, int] = {}
+        for r in rows:
+            if r["status"] != "EXECUTE":
+                for part in (r.get("reason") or "no reason recorded").split(";"):
+                    k = re.sub(r"\d+(\.\d+)?", "#", re.sub(r"strategy \S+ ", "strategy ", part.strip()))[:90]
+                    k = k or "no reason recorded"
+                    reasons[k] = reasons.get(k, 0) + 1
         return {"summary": last, "stage1": db.kv_get("stage1") or {}, "opportunities": rows,
+                "market": market_status(), "rejection_reasons": sorted(reasons.items(), key=lambda x: -x[1]),
+                "upcoming": db.kv_get("upcoming") or {}, "crypto": db.kv_get("crypto_scan") or {},
                 "note": "Score is a 0-100 ranking index, NOT a win probability (uncalibrated until enough forward trades)."}
+
+    def market_status():
+        now = now_utc()
+        today = now.astimezone(ET).date()
+        sess = session(today)
+        if sess and sess[0] <= now <= sess[1]:
+            state, nxt = "open", None
+            closes = to_pt(sess[1]).strftime("%a %b %d %I:%M %p PT")
+        else:
+            state, closes = "closed", None
+            d = today if (sess and now < sess[0]) else next_trading_day(today)
+            nxt = to_pt(session(d)[0]).strftime("%a %b %d %I:%M %p PT")
+        return {"us_stocks": state, "closes_pt": closes, "next_open_pt": nxt, "crypto": "open 24/7",
+                "now_pt": fmt_pt(now)}
+
+    @app.get("/api/books")
+    def books(user=Depends(auth)):
+        from ..books import BOOK_CAPITAL, DEMOTE, PROMOTE, SCHEMA
+        for stmt in SCHEMA.strip().split(";"):  # the engine may not have created the table yet
+            if stmt.strip():
+                db.execute(stmt)
+        b = db.kv_get("books") or {}
+        prices = b.get("prices") or {}
+        opens = db.query("SELECT * FROM book_trades WHERE status='open' ORDER BY entry_time")
+        for t in opens:
+            px = prices.get(t["symbol"])
+            t["current_price"] = px
+            t["pnl_now"] = (px - t["entry_price"]) * t["qty"] - (t["fees"] or 0) if px else None
+        closed = db.query("SELECT strategy, engine, symbol, entry_time, exit_time, entry_price, exit_price, pnl, r, "
+                          "exit_reason, fees FROM book_trades WHERE status='closed' ORDER BY exit_time DESC LIMIT 100")
+        return {"as_of": b.get("at"), "capital": BOOK_CAPITAL, "strategies": b.get("strategies", []),
+                "open": opens, "closed": closed, "promote_rule": PROMOTE, "demote_rule": DEMOTE,
+                "market": market_status(),
+                "note": ("Every strategy runs its own simulated $100 book on the same live prices, the same cost model "
+                         "and the same risk limits. Only validated, owner-approved experimental or forward-promoted "
+                         "strategies place real paper orders. Promotion and demotion rules were fixed before any "
+                         "forward result was seen.")}
 
     @app.get("/api/positions")
     def positions(user=Depends(auth)):

@@ -84,8 +84,24 @@ async function renderScanner() {
   const d = await api("/api/scanner");
   const st = d.stage1 || {}, sm = d.summary || {};
   const rows = d.opportunities;
-  $("#scanner").innerHTML = `<div class="grid">${kpi("Assets scanned (stage 1)", st.scanned ?? "-")}${kpi("Evaluated (stage 2)", sm.evaluated ?? "-")}
+  const mk = d.market || {}, up = d.upcoming || {}, cr = d.crypto || {};
+  $("#scanner").innerHTML = `<div class="grid">${kpi("US stocks", esc(mk.us_stocks || "-"), mk.us_stocks === "open" ? "pos" : "")}
+    ${kpi(mk.us_stocks === "open" ? "Closes" : "Next open", esc((mk.us_stocks === "open" ? mk.closes_pt : mk.next_open_pt) || "-"))}
+    ${kpi("Crypto", esc(mk.crypto || "-"), "pos")}${kpi("Crypto pairs evaluated", cr.evaluated ?? "-")}</div>
+    <div class="grid">${kpi("Assets scanned (stage 1)", st.scanned ?? "-")}${kpi("Evaluated (stage 2)", sm.evaluated ?? "-")}
     ${kpi("Signals", sm.signals ?? "-")}${kpi("Executed", sm.executed ?? "-")}</div>
+    <div class="card"><h2>Why setups were not traded (last analysis)</h2>${table([["Reason", (r) => esc(r[0])], ["Count", (r) => r[1]]],
+      d.rejection_reasons || [])}</div>
+    <div class="card"><h2>Upcoming swing opportunities${up.next_session ? " for " + esc(up.next_session) : ""}</h2>
+      <p class="muted small">Daily signals on the latest closed bar; they are entered at the next open if they still qualify then. As of ${esc(up.as_of || "-")}.</p>
+      ${table([["Symbol", (r) => esc(r.symbol)], ["Strategy", (r) => esc(r.strategy)], ["Status", (r) => esc(r.status)],
+      ["Close", (r) => num(r.close)], ["Stop", (r) => num(r.stop)], ["Real paper order", (r) => r.real_paper_order ? "yes" : "book only"]],
+      up.signals || [])}</div>
+    <div class="card"><h2>Crypto (24/7, hourly bars)</h2><p class="muted small">${esc(cr.pairs ?? "-")} pairs listed, ${esc(cr.scanned ?? "-")} with data,
+      ${esc(cr.evaluated ?? "-")} liquid enough to evaluate. Last bar ${esc(cr.bar || "-")}. Crypto runs in its strategies' simulated books only.</p>
+      ${table([["Symbol", (r) => esc(r.symbol)], ["Strategy", (r) => esc(r.strategy)], ["Price", (r) => num(r.price)],
+      ["Stop", (r) => num(r.stop)], ["Spread", (r) => num(r.spread_bps, 1) + "bps"], ["Taken", (r) => r.taken ? "yes" : "no (cost/spread)"]],
+      cr.signals || [])}</div>
     <div class="card"><h2>Watchlist</h2><p>${(sm.watchlist || []).map(esc).join(", ") || "-"}</p><p class="muted small">${esc(d.note)} Last analysis: ${esc(sm.ts || "-")}</p></div>
     <div class="card"><h2>Opportunities</h2>${table([
       ["Status", (r) => `<span class="tag ${esc(r.status)}">${esc(r.status)}</span>`], ["Symbol", (r) => esc(r.symbol)],
@@ -96,6 +112,39 @@ async function renderScanner() {
       ["Chg", (r) => pct(r.change_pct)], ["Gap", (r) => pct(r.gap_pct)], ["RelVol (IEX)", (r) => num(r.relvol_iex)],
       ["IEX spread", (r) => num(r.spread_bps_iex, 1) + "bps"], ["Score", (r) => num(r.stage1_score)]], st.top || [])}</div>`;
   bindRows($("#scanner"), rows, (r) => modal(`<h2>${esc(r.symbol)} / ${esc(r.strategy)}</h2><pre>${esc(JSON.stringify(r.detail, null, 1))}</pre>`));
+}
+
+async function renderBooks() {
+  const d = await api("/api/books");
+  const rows = (d.strategies || []).slice().sort((a, b) => (b.return_pct - a.return_pct) || (b.closed_trades - a.closed_trades));
+  const eng = (e) => ({day: "Day trading", swing: "Swing", crypto: "Crypto 24/7"}[e] || e);
+  const sum = (e) => rows.filter((r) => r.engine === e);
+  const tot = (e) => sum(e).reduce((a, r) => a + (r.equity - d.capital), 0);
+  const pr = d.promote_rule || {}, dr = d.demote_rule || {};
+  $("#books").innerHTML = `<div class="grid">${["day", "swing", "crypto"].map((e) => kpi(eng(e) + " books P&L", money(tot(e)), sgn(tot(e)))).join("")}
+    ${kpi("Open simulated trades", (d.open || []).length)}</div>
+    <div class="card"><h2>Strategy portfolios ($${num(d.capital, 0)} each)</h2><p class="muted small">${esc(d.note)} Updated ${esc(d.as_of || "-")}.</p>
+    ${table([["Strategy", (r) => esc(r.strategy)], ["Engine", (r) => esc(eng(r.engine))],
+      ["Equity", (r) => `${money(r.equity)} <span class="${sgn(r.return_pct)}">(${pct(r.return_pct)})</span>`],
+      ["Trades", (r) => r.closed_trades + (r.open_trades ? ` (+${r.open_trades} open)` : "") + (r.mean_r === null ? "" : `, avg ${num(r.mean_r)}R`)],
+      ["Status", (r) => `<span class="tag">${esc(r.forward)}</span> ${r.real_paper_orders ? "real paper orders" : "book only"}`]], rows, true)}
+    <p class="muted small">Tap a strategy for win rate, profit factor, drawdown and research results.</p>
+    <p class="muted small">Promotion needs at least ${esc(pr.min_trades)} forward trades, Holm-adjusted p at most ${esc(pr.max_holm_p)}, profit factor at least
+      ${esc(pr.min_pf)}, average R at least ${esc(pr.min_mean_r)} and a positive return. Demotion after ${esc(dr.min_trades)} trades if average R is at or below
+      ${esc(dr.max_mean_r)} or drawdown reaches ${esc(dr.max_drawdown_pct)}%.</p></div>
+    <div class="card"><h2>Open simulated trades</h2>${table([["Strategy", (r) => esc(r.strategy)], ["Symbol", (r) => esc(r.symbol)],
+      ["Entry", (r) => num(r.entry_price)], ["Now", (r) => num(r.current_price)], ["Stop", (r) => num(r.stop)],
+      ["P&L", (r) => `<span class="${sgn(r.pnl_now)}">${money(r.pnl_now)}</span>`], ["Since", (r) => esc((r.entry_time || "").slice(0, 16))]], d.open || [])}</div>
+    <div class="card"><h2>Recent closed simulated trades</h2>${table([["Strategy", (r) => esc(r.strategy)], ["Symbol", (r) => esc(r.symbol)],
+      ["P&L", (r) => `<span class="${sgn(r.pnl)}">${money(r.pnl)}</span>`], ["R", (r) => num(r.r)], ["Exit", (r) => esc(r.exit_reason)],
+      ["Closed", (r) => esc((r.exit_time || "").slice(0, 16))]], d.closed || [])}</div>`;
+  bindRows($("#books"), rows, (r) => modal(`<h2>${esc(r.strategy)}</h2><p>${esc(r.description)}</p><p class="small">${esc(r.forward_why || "")}</p>
+    <div class="kv"><div>Engine</div><div>${esc(eng(r.engine))}</div><div>Equity</div><div>${money(r.equity)} (${pct(r.return_pct)})</div>
+    <div>Win rate</div><div>${r.win_rate === null ? "-" : num(r.win_rate, 0) + "%"}</div><div>Average R</div><div>${num(r.mean_r)}</div>
+    <div>Profit factor</div><div>${r.profit_factor === 99 ? "no losses yet" : num(r.profit_factor)}</div><div>Max drawdown</div><div>${pct(-r.max_dd_pct)}</div>
+    <div>Forward test</div><div>${esc(r.forward)}</div><div>Research status</div><div>${esc(r.research_status)}</div>
+    <div>Research holdout avg R</div><div>${num(r.holdout_mean_r)}</div><div>Holdout trades</div><div>${esc(r.holdout_trades ?? "-")}</div>
+    <div>Fees paid</div><div>${money(r.fees)}</div><div>p-value (unadjusted)</div><div>${num(r.p_value, 3)}</div><div>Book started</div><div>${esc(r.since || "-")}</div></div>`));
 }
 
 async function renderPositions() {
@@ -216,7 +265,7 @@ async function sendCmd(command, args, phrase) {
   } catch (e) { const m = $("#cmdMsg"); if (m) { m.className = "neg"; m.textContent = e.message; } else alert(e.message); }
 }
 
-const renderers = {overview: renderOverview, scanner: renderScanner, positions: renderPositions, guardian: renderGuardian,
+const renderers = {overview: renderOverview, books: renderBooks, scanner: renderScanner, positions: renderPositions, guardian: renderGuardian,
   tournament: renderTournament, research: renderResearch, trades: renderTrades, reports: renderReports, system: renderSystem, control: renderControl};
 // A tab that fails to load shows the reason instead of a blank page, and keeps retrying every 15 seconds.
 const reported = new Set();
