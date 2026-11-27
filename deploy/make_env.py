@@ -60,7 +60,8 @@ def build(env: dict, overnight: bool, auto_approve: bool, experimental: str = ""
         "ALPACA_DATA_FEED": "iex",
         "ALPACA_RESEARCH_FEED": "sip",
         "QT_DATA_DIR": "/app/data",
-        "ALLOW_CRYPTO_EXECUTION": "false",
+        # paper crypto orders, only for crypto strategies that validate or earn forward promotion (owner, 2026-11-27)
+        "ALLOW_CRYPTO_EXECUTION": env.get("ALLOW_CRYPTO_EXECUTION", "false"),
         "ALLOW_OVERNIGHT_HOLDS": "true" if overnight else "false",
         "AUTO_APPROVE_VALIDATED": "true" if auto_approve else "false",
         "EXPERIMENTAL_STRATEGIES": experimental,   # owner-approved, unvalidated, paper only

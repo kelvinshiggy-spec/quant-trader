@@ -82,3 +82,57 @@ def test_crypto_book_trades_on_weekend(tmp_path, monkeypatch):
     sc = c.get("/api/scanner").json()
     assert sc["market"]["crypto"] == "open 24/7" and sc["crypto"]["evaluated"] >= 1
     assert "rejection_reasons" in sc and "upcoming" in sc
+
+
+def test_promoted_crypto_strategy_places_real_paper_order_on_weekend(tmp_path, monkeypatch):
+    import qt.engine as engmod
+    for k in [k for k, v in library.BY_NAME.items() if v().timeframe == "1Hour"]:
+        monkeypatch.delitem(engmod.BY_NAME, k)
+    monkeypatch.setitem(engmod.BY_NAME, "Z_crypto", CryptoAlways)
+    s = settings(tmp_path, ALLOW_CRYPTO_EXECUTION="true")
+    t = [dt.datetime(2026, 11, 28, 15, 2, tzinfo=dt.timezone.utc)]
+    bars = _hourly(pd.Timestamp("2026-11-28 15:00", tz="UTC"))
+    b = SimBroker(prices={"BTC/USD": float(bars["close"].iloc[-2])}, now=t[0], bars_data={"BTC/USD": bars})
+    db = DB(s.db_path)
+    db.upsert("strategy_status", {"strategy": "Z_crypto", "version": "1", "params": "{}", "status": "rejected",
+                                  "approved": 0, "oos_metrics": {}, "allowed_regimes": None}, "strategy")
+    db.kv_set("forward_status", {"Z_crypto": {"status": "promoted", "mean_r": 0.3, "holm_p": 0.001}})
+    e = Engine(s, broker=b, db=db, hist=FakeHist(), notifier=lambda *a, **k: None, clock=lambda: t[0])
+    e.startup()
+    e.cycle()
+    tr = db.one("SELECT * FROM trades")
+    assert tr and tr["symbol"] == "BTC/USD" and tr["asset_class"] == "crypto" and tr["strategy"] == "Z_crypto"
+    assert db.one("SELECT COUNT(*) c FROM book_trades")["c"] == 1   # its book still records the same signal
+    for _ in range(3):
+        e.cycle()
+    tr = db.one("SELECT * FROM trades")
+    assert tr["status"] == "open" and tr["qty"] > 0
+    assert e.integrity == {}
+    stop = db.one("SELECT * FROM orders WHERE kind='stop'")
+    assert stop and stop["status"] not in ("rejected",)               # broker-side protective stop (stop-limit)
+    # Sunday crash: the stop protects the position with the stock market shut
+    t[0] = dt.datetime(2026, 11, 29, 3, 0, tzinfo=dt.timezone.utc)
+    b.now = t[0]
+    b.prices["BTC/USD"] = tr["stop_price"] * 0.97
+    for _ in range(4):
+        e.cycle()
+    tr = db.one("SELECT * FROM trades")
+    assert tr["status"] == "closed" and tr["pnl"] < 0
+
+
+def test_crypto_not_traded_without_owner_switch(tmp_path, monkeypatch):
+    import qt.engine as engmod
+    for k in [k for k, v in library.BY_NAME.items() if v().timeframe == "1Hour"]:
+        monkeypatch.delitem(engmod.BY_NAME, k)
+    monkeypatch.setitem(engmod.BY_NAME, "Z_crypto", CryptoAlways)
+    s = settings(tmp_path)
+    t = [dt.datetime(2026, 11, 28, 15, 2, tzinfo=dt.timezone.utc)]
+    bars = _hourly(pd.Timestamp("2026-11-28 15:00", tz="UTC"))
+    b = SimBroker(prices={"BTC/USD": float(bars["close"].iloc[-2])}, now=t[0], bars_data={"BTC/USD": bars})
+    db = DB(s.db_path)
+    db.upsert("strategy_status", {"strategy": "Z_crypto", "version": "1", "params": "{}", "status": "rejected",
+                                  "approved": 0, "oos_metrics": {}, "allowed_regimes": None}, "strategy")
+    db.kv_set("forward_status", {"Z_crypto": {"status": "promoted", "mean_r": 0.3, "holm_p": 0.001}})
+    e = Engine(s, broker=b, db=db, hist=FakeHist(), notifier=lambda *a, **k: None, clock=lambda: t[0])
+    e.startup(); e.cycle()
+    assert db.one("SELECT COUNT(*) c FROM trades")["c"] == 0

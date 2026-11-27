@@ -240,7 +240,10 @@ class TradeManager:
         fee = qty * price * 0.0025 if ac == "crypto" else 0.0
         if row["side"] == "buy":
             if ac == "crypto":
-                fee = 0.0  # Alpaca takes crypto buy fees in the asset received; qty already net
+                # Alpaca takes the crypto buy fee in the coin received: the position holds qty minus 0.25%. The ledger
+                # holds the net coin and books the fee, so cash spent is still qty * price.
+                fee = qty * price * 0.0025
+                qty = qty - qty * 0.0025  # net qty * price + fee == gross qty * price
             self.ledger.apply_buy_fill(t["symbol"], qty, price, fee, when, t["strategy"], t["trade_id"], ac,
                                        order_key=row["client_order_id"])
             p = self.ledger.positions[t["symbol"]]
@@ -404,8 +407,8 @@ class TradeManager:
             mfe = max(t["mfe"] or 0.0, (px - entry) / R)
             mae = min(t["mae"] or 0.0, (px - entry) / R)
             self._upd(t["trade_id"], mfe=mfe, mae=mae)
-            if not market_open:
-                continue
+            if not market_open and t["asset_class"] != "crypto":
+                continue  # crypto trades 24/7: always managed
             if flatten_now and plan.get("flatten_eod", True):
                 self.request_exit(t, "eod_flatten")
                 continue
@@ -441,7 +444,7 @@ class TradeManager:
                 if bar.get("exit_sig"):
                     self.request_exit(self.trade(t["trade_id"]), "thesis_invalidated")
                     continue
-                if plan.get("max_bars") and t["entry_time"] and plan.get("timeframe", "5Min") == "5Min":
+                if plan.get("max_bars") and t["entry_time"] and plan.get("timeframe", "5Min") in ("5Min", "1Hour"):
                     held_min = (now - dt.datetime.fromisoformat(t["entry_time"])).total_seconds() / 60
                     if held_min >= plan["max_bars"] * bar.get("bar_minutes", 5):
                         self.request_exit(self.trade(t["trade_id"]), "time_exit")
