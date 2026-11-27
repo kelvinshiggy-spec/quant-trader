@@ -282,14 +282,14 @@ class Engine:
         from .universe import DAILY_UNIVERSE
         today = now.astimezone(ET).date()
         active, shadow = self.active_strategies("1Day")
-        # re-run today if the set of trading daily strategies changed since this morning's run (owner approval)
-        stamp = today.isoformat() + "|" + ",".join(sorted(r["strategy"] for r in active))
-        done = self.db.kv_get("daily_cycle_done")
-        if done == stamp or (done == today.isoformat() and not active):
-            return
         wide = [u["symbol"] for u in self.universe
                 if u.get("adv") and not u.get("leveraged") and not is_leveraged_or_inverse(u["symbol"], u.get("name", ""))
                 and u["symbol"] not in DAILY_UNIVERSE][:self.s.swing_wide_n] if self.s.swing_wide_n > 0 else []
+        # re-run today if the set of trading daily strategies changed since this morning's run (owner approval)
+        stamp = today.isoformat() + "|" + ",".join(sorted(r["strategy"] for r in active)) + f"|wide{len(wide)}"
+        done = self.db.kv_get("daily_cycle_done")
+        if done == stamp or (done == today.isoformat() and not active):
+            return
         scan = list(DAILY_UNIVERSE) + wide
         wide_set = set(wide)
         missing = [x for x in scan if x not in self.daily]
@@ -304,6 +304,9 @@ class Engine:
             if sym in scan and len(d) > 210:
                 confirmed[sym] = d[d.index.tz_convert(ET).date < today]  # confirmed bars only
         feats = daily_panel(confirmed, min_len=210)
+        # wide-universe names must actually move: drops T-bill / cash-like funds (ATR under 0.5% of price)
+        feats = {k: f for k, f in feats.items()
+                 if k not in wide_set or (f["atr"].iloc[-1] / f["close"].iloc[-1] >= 0.005)}
         regime_label = describe_current(self.regimes, today)["label"] if self.regimes is not None else "unknown"
         reg_c = coarse(regime_label)
         held = {t["symbol"]: t for t in self.tm.active_trades()}

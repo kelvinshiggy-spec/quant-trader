@@ -113,3 +113,67 @@ def test_forced_trade_skips_leveraged_funds(tmp_path, monkeypatch):
     e.force_daily_minimum([], now, now - dt.timedelta(hours=2))
     tr = db.one("SELECT * FROM trades")
     assert tr and tr["symbol"] == "QQQ"
+
+
+# ---------------------------------------------------------------- daily (swing) path with the wide universe
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
+from dataclasses import dataclass, field  # noqa: E402
+from qt.strategies.base import ExitPlan, Strategy, frame  # noqa: E402
+
+
+@dataclass
+class DailyAlways(Strategy):
+    name: str = "Z_daily"
+    description: str = "test: daily signal on every bar"
+    timeframe: str = "1Day"
+    overnight: bool = True
+    universe: tuple = ("SPY",)
+    defaults: dict = field(default_factory=dict)
+
+    def exit_plan(self):
+        return ExitPlan(trail_atr=3.0, trail_activate_r=1.0, flatten_eod=False)
+
+    def signals(self, f):
+        return frame(f, np.ones(len(f), bool), f["close"] - 2 * f["atr"], strength=pd.Series(1.0, index=f.index))
+
+
+def _daily(px, vol, n=400, end=dt.date(2026, 11, 23)):
+    idx = pd.bdate_range(end=end, periods=n, tz="UTC") + pd.Timedelta(hours=5)
+    rng = np.random.default_rng(abs(hash(px)) % 1000)
+    c = px * np.cumprod(1 + rng.normal(0.0005, vol, n))
+    return pd.DataFrame({"open": c, "high": c * (1 + vol), "low": c * (1 - vol), "close": c, "volume": 1e7}, index=idx)
+
+
+class DailyHist:
+    def __init__(self, data):
+        self.data = data
+
+    def _fetch(self, syms, *a, **k):
+        return {s: self.data[s] for s in syms if s in self.data}
+
+
+def test_daily_cycle_trades_wide_universe_and_skips_cash_like(tmp_path, monkeypatch):
+    import qt.engine as engmod
+    monkeypatch.setitem(library.BY_NAME, "Z_daily", DailyAlways)
+    monkeypatch.setitem(engmod.BY_NAME, "Z_daily", DailyAlways)
+    s = settings(tmp_path, EXPERIMENTAL_STRATEGIES="Z_daily", ALLOW_OVERNIGHT_HOLDS="true", SWING_WIDE_UNIVERSE="5")
+    s = dataclasses.replace(s, swing_wide_strategies=("Z_daily",))
+    t = [dt.datetime(2026, 11, 24, 15, 0, tzinfo=dt.timezone.utc)]  # 10:00 ET
+    data = {"ABC": _daily(50.0, 0.02), "BILX": _daily(100.0, 0.0002)}
+    b = SimBroker(prices={"ABC": float(data["ABC"]["close"].iloc[-1]), "BILX": 100.0}, now=t[0])
+    db = DB(s.db_path)
+    db.upsert("strategy_status", {"strategy": "Z_daily", "version": "1", "params": "{}", "status": "shadow",
+                                  "approved": 0, "oos_metrics": {"expectancy_r": 0.3, "trades": 300},
+                                  "allowed_regimes": None}, "strategy")
+    e = Engine(s, broker=b, db=db, hist=DailyHist(data), notifier=lambda *a, **k: None, clock=lambda: t[0])
+    e.universe = [{"symbol": "ABC", "adv": 5e8}, {"symbol": "BILX", "adv": 5e8}, {"symbol": "TQQQ", "adv": 9e9}]
+    e.daily_cycle(t[0])
+    opps = {r["symbol"] for r in db.query("SELECT symbol FROM opportunities WHERE strategy='Z_daily'")}
+    assert "ABC" in opps and "BILX" not in opps and "TQQQ" not in opps
+    tr = db.one("SELECT * FROM trades")
+    assert tr and tr["symbol"] == "ABC" and tr["thesis"].startswith("EXPERIMENTAL")
+    # same day, same settings: not re-run
+    n = db.one("SELECT COUNT(*) c FROM opportunities")["c"]
+    e.daily_cycle(t[0])
+    assert db.one("SELECT COUNT(*) c FROM opportunities")["c"] == n
