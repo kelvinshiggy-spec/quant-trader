@@ -314,7 +314,8 @@ class CryptoMeanReversion(Strategy):
     timeframe: str = "1Hour"
     asset_class: str = "crypto"
     overnight: bool = True
-    description: str = "Hourly RSI washout inside a long-term crypto uptrend; target EMA24."
+    version: str = "1.1.0"  # 1.0.0 had contradictory filters (RSI<25 above hourly EMA200): ~0 signals
+    description: str = "Hourly RSI washout while the ~20-day EMA is rising; target EMA24."
     defaults: dict = field(default_factory=lambda: {"rsi": 25})
     grid: dict = field(default_factory=lambda: {"rsi": [20, 30]})
 
@@ -322,7 +323,7 @@ class CryptoMeanReversion(Strategy):
         return ExitPlan(max_bars=48, flatten_eod=False)
 
     def signals(self, f):
-        cond = (f["rsi14"] < self.p("rsi")) & (f["close"] > f["ema200"]) & (f["close"] > f["open"])
+        cond = (f["rsi14"].shift(1) < self.p("rsi")) & (f["ema480"] > f["ema480"].shift(24)) & (f["close"] > f["open"])
         stop = f["close"] - 2.5 * f["atr"]
         return frame(f, cond, stop, target=f["ema24"], strength=50 - f["rsi14"])
 

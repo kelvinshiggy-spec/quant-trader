@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Quant Trader</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div id="login" class="login hidden">
+  <form id="loginForm" class="card">
+    <h1>Quant Trader</h1>
+    <p class="muted">Paper trading control center</p>
+    <input id="u" autocomplete="username" placeholder="Username" required>
+    <input id="p" type="password" autocomplete="current-password" placeholder="Password" required>
+    <button type="submit" class="btn primary">Sign in</button>
+    <p id="loginErr" class="neg"></p>
+  </form>
+</div>
+<div id="app" class="hidden">
+  <header class="top">
+    <div class="brand">Quant Trader <span id="mode" class="pill">PAPER</span></div>
+    <div class="hstat"><span id="botStatus" class="dot"></span><span id="now"></span></div>
+  </header>
+  <div class="banner" id="dataLabel"></div>
+  <nav id="tabs">
+    <button data-tab="overview" class="active">Overview</button>
+    <button data-tab="scanner">Scanner</button>
+    <button data-tab="positions">Positions</button>
+    <button data-tab="guardian">Guardian</button>
+    <button data-tab="tournament">Tournament</button>
+    <button data-tab="research">Research</button>
+    <button data-tab="trades">Trades</button>
+    <button data-tab="reports">Reports</button>
+    <button data-tab="system">System</button>
+    <button data-tab="control">Control</button>
+  </nav>
+  <main>
+    <section id="overview" class="tab active"></section>
+    <section id="scanner" class="tab"></section>
+    <section id="positions" class="tab"></section>
+    <section id="guardian" class="tab"></section>
+    <section id="tournament" class="tab"></section>
+    <section id="research" class="tab"></section>
+    <section id="trades" class="tab"></section>
+    <section id="reports" class="tab"></section>
+    <section id="system" class="tab"></section>
+    <section id="control" class="tab"></section>
+  </main>
+  <div id="modal" class="modal hidden"><div class="card" id="modalBody"></div></div>
+</div>
+<script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,73 @@
+# Production stack. Start: docker compose up -d --build
+# Every service restarts automatically (crash, reboot); autoheal restarts any container whose healthcheck fails.
+x-common: &common
+  build: .
+  image: quant-trader:latest
+  env_file: .env
+  volumes:
+    - ./data:/app/data
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options: {max-size: "10m", max-file: "5"}
+  labels:
+    autoheal: "true"
+
+services:
+  engine:
+    <<: *common
+    command: ["python", "-m", "qt.engine"]
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "python", "-m", "qt.healthcheck", "engine"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 180s
+
+  api:
+    <<: *common
+    command: ["python", "-m", "qt.api.app"]
+    ports:
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test: ["CMD", "python", "-m", "qt.healthcheck", "api"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  research:
+    <<: *common
+    command: ["python", "-m", "qt.research.scheduler"]
+    environment:
+      RESEARCH_WORKERS: "${RESEARCH_WORKERS:-1}"
+    mem_limit: "${RESEARCH_MEM_LIMIT:-900m}"
+    cpus: 1.0
+    healthcheck:
+      test: ["CMD", "python", "-m", "qt.healthcheck", "research"]
+      interval: 300s
+      timeout: 10s
+      retries: 3
+      start_period: 600s
+
+  caddy:
+    image: caddy:2.8.4
+    restart: unless-stopped
+    ports: ["80:80", "443:443"]
+    command: ["caddy", "reverse-proxy", "--from", "${DASHBOARD_DOMAIN}", "--to", "api:8080"]
+    volumes:
+      - caddy_data:/data
+    depends_on: [api]
+
+  autoheal:
+    image: willfarrell/autoheal:1.2.0
+    restart: unless-stopped
+    environment:
+      AUTOHEAL_CONTAINER_LABEL: autoheal
+      AUTOHEAL_INTERVAL: "30"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+volumes:
+  caddy_data:

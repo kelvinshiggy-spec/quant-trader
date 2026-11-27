@@ -98,6 +98,7 @@ def hourly_crypto_features(d: pd.DataFrame) -> pd.DataFrame:
     f["ema24"] = ind.ema(c, 24)
     f["ema72"] = ind.ema(c, 72)
     f["ema200"] = ind.ema(c, 200)
+    f["ema480"] = ind.ema(c, 480)  # ~20 days
     f["rsi14"] = ind.rsi(c, 14)
     f["hh48"] = ind.donchian_high(f["high"], 48)
     f["vol_rel"] = f["volume"] / f["volume"].shift(1).rolling(72, min_periods=24).mean()
