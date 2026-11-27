@@ -69,6 +69,12 @@ class Engine:
         self.marks = self.db.kv_get("marks", {})
         self.bars: dict[str, pd.DataFrame] = {}
         self.daily: dict[str, pd.DataFrame] = {}
+        self._daily_asof: dict[str, dt.date] = {}   # day each symbol's daily bars were last refreshed
+        self.crypto_bars: dict = {}
+        self.crypto_last: dict = {}
+        self._crypto_hour = None
+        self._crypto_universe: list = []
+        self._crypto_universe_date = None
         self.daily_date: dt.date | None = None
         self.regimes: pd.DataFrame | None = None
         self.watchlist: list[str] = self.db.kv_get("watchlist", default_universe()[:20])
@@ -218,6 +224,8 @@ class Engine:
             d = self.hist._fetch(syms, "1Day", today - dt.timedelta(days=560), today - dt.timedelta(days=1),
                                  "us_equity", "sip")
             self.daily.update(d)
+            for k in d:
+                self._daily_asof[k] = today
             sect = {k: self.daily[k] for k in ("XLK", "XLF", "XLV", "XLE", "XLI", "XLY", "XLP", "XLU", "XLB", "XLC",
                                                 "XLRE") if k in self.daily}
             if "SPY" in self.daily:
@@ -308,11 +316,15 @@ class Engine:
             return
         scan = list(DAILY_UNIVERSE) + wide
         wide_set = set(wide)
-        missing = [x for x in scan if x not in self.daily]
+        # refresh every symbol once per day (bars fetched yesterday lack yesterday's close)
+        missing = [x for x in scan if self._daily_asof.get(x) != today]
         if missing:
             try:
-                self.daily.update(self.hist._fetch(missing, "1Day", today - dt.timedelta(days=560),
-                                                   today - dt.timedelta(days=1), "us_equity", "sip"))
+                fresh = self.hist._fetch(missing, "1Day", today - dt.timedelta(days=560),
+                                         today - dt.timedelta(days=1), "us_equity", "sip")
+                self.daily.update(fresh)
+                for k in fresh:
+                    self._daily_asof[k] = today
             except Exception as e:  # noqa: BLE001
                 log.warning("daily universe fetch failed: %s", e)
         confirmed = {}
@@ -381,6 +393,164 @@ class Engine:
             self.act(opps, now)
             self.feed_books(opps, now, "swing")
         self.db.kv_set("daily_cycle_done", stamp)
+
+    # ------------------------------------------------------------ crypto (24/7, hourly)
+    CRYPTO_CORE = ("BTC/USD", "ETH/USD", "SOL/USD", "PAXG/USD")  # PAXG = tokenised gold
+    STABLECOINS = ("USDC", "USDT", "USDG", "DAI", "PYUSD", "TUSD", "BUSD", "FDUSD", "USDP")
+    CRYPTO_MIN_ADV = 500_000.0  # $/day; thinner pairs have spreads that eat any edge
+
+    def crypto_universe(self, today: dt.date) -> list[str]:
+        if self._crypto_universe_date == today and self._crypto_universe:
+            return self._crypto_universe
+        try:
+            assets = self.broker.list_assets("crypto")
+            syms = sorted({a["symbol"] for a in assets if a.get("tradable") and a["symbol"].endswith("/USD")
+                           and a["symbol"].split("/")[0] not in self.STABLECOINS})
+        except Exception as e:  # noqa: BLE001
+            log.warning("crypto asset list failed: %s", e)
+            syms = []
+        self._crypto_universe = list(dict.fromkeys(list(self.CRYPTO_CORE) + syms))
+        self._crypto_universe_date = today
+        return self._crypto_universe
+
+    def crypto_strategies(self) -> list[dict]:
+        active, shadow = self.active_strategies("1Hour")
+        rows = active + shadow + self._book_only.get("1Hour", [])
+        have = {r["strategy"] for r in rows}
+        for name, cls in BY_NAME.items():  # never researched yet: still forward-tested in its own book
+            inst = cls()
+            if inst.timeframe == "1Hour" and name not in have:
+                rows.append({"strategy": name, "status": "rejected", "approved": 0, "_inst": inst, "_oos": {},
+                             "_allowed": None})
+        return rows
+
+    def crypto_cycle(self, now: dt.datetime) -> None:
+        """Crypto never closes: every hour on the CONFIRMED hourly bar, hourly strategies run on liquid
+        Alpaca crypto pairs (incl. PAXG gold). Real paper orders need ALLOW_CRYPTO_EXECUTION (not wired), so
+        signals go to each strategy's own simulated $100 crypto book with Alpaca's taker fees."""
+        from .strategies.features import hourly_crypto_features
+        boundary = pd.Timestamp(now).floor("60min")
+        if self._crypto_hour == boundary or (now - boundary.to_pydatetime()).total_seconds() < 60:
+            return
+        self._crypto_hour = boundary
+        syms = self.crypto_universe(now.astimezone(ET).date())
+        if not syms:
+            return
+        try:
+            need_full = [x for x in syms if x not in self.crypto_bars]
+            if need_full:
+                self.crypto_bars.update(self.broker.recent_bars(need_full, "1Hour", now - dt.timedelta(days=45)))
+            have = [x for x in syms if x in self.crypto_bars]
+            if have:
+                new = self.broker.recent_bars(have, "1Hour", now - dt.timedelta(hours=6))
+                for k, d in new.items():
+                    old = self.crypto_bars.get(k)
+                    self.crypto_bars[k] = (pd.concat([old, d]).loc[lambda x: ~x.index.duplicated(keep="last")]
+                                           .sort_index().iloc[-1500:]) if old is not None else d
+        except BrokerError as e:
+            log.warning("crypto bars failed: %s", e)
+            return
+        strategies = self.crypto_strategies()
+        book_open = {(t["strategy"], t["symbol"]): t for t in self.books.open_trades() if "/" in t["symbol"]}
+        opps, scanned, evaluated = [], 0, 0
+        for sym in syms:
+            d = self.crypto_bars.get(sym)
+            if d is None or d.empty:
+                continue
+            scanned += 1
+            d = d[d.index + pd.Timedelta(hours=1) <= pd.Timestamp(now)]  # confirmed bars only
+            if len(d) < 500:
+                continue
+            f = hourly_crypto_features(d)
+            f["session"] = f.index.date
+            last = f.iloc[-1]
+            adv = float(last["adv"]) if pd.notna(last["adv"]) else 0.0
+            self.crypto_last[sym] = {"atr": float(last["atr"]), "close": float(last["close"]), "adv": adv}
+            if sym not in self.CRYPTO_CORE and adv < self.CRYPTO_MIN_ADV:
+                continue
+            evaluated += 1
+            for r in strategies:
+                inst = r["_inst"]
+                sig = inst.signals(f).iloc[-1]
+                if (r["strategy"], sym) in book_open:
+                    if bool(sig["exit_sig"]):
+                        self.books.signal_exit(r["strategy"], sym, now, self.prices, self.spreads.get(sym))
+                    continue
+                if not bool(sig["entry"]):
+                    continue
+                spread = max(self.costs.spread_bps("crypto", adv, sym), 0.0)
+                o = Opportunity(symbol=sym, strategy=r["strategy"], price=float(last["close"]), change_pct=0.0,
+                                relvol=float(last["vol_rel"]) if pd.notna(last["vol_rel"]) else None, momentum=None,
+                                regime="crypto", stop=float(sig["stop"]),
+                                target=float(sig["target"]) if pd.notna(sig["target"]) else None,
+                                atr=float(last["atr"]), spread_bps=spread,
+                                est_cost_bps=self.costs.round_trip_bps("crypto", spread), data_age_s=0.0, signal=True,
+                                strength=float(sig["strength"]), strategy_status=r["status"], strategy_approved=False,
+                                oos_expectancy_r=r["_oos"].get("expectancy_r"), oos_trades=int(r["_oos"].get("trades", 0)),
+                                holm_p=r["_oos"].get("holm_p"), regime_allowed=True, adv=adv or None)
+                o.explanation = {"conditions": {"hourly close": float(last["close"])},
+                                 "exit_plan": inst.exit_plan().describe(), "bar": str(f.index[-1]),
+                                 "feed": "Alpaca crypto hourly (confirmed bars)", "timeframe": "1Hour"}
+                score(o, self.limits.stale_data_seconds, self.limits.max_spread_bps)
+                opps.append(o)
+        if opps:
+            self.refresh_quotes([o.symbol for o in opps])
+            for o in opps:
+                o.price = float(self.prices.get(o.symbol, o.price))
+                live = self.spreads.get(o.symbol)
+                if live is not None:  # real quoted spread when it is worse than the model
+                    o.spread_bps = max(o.spread_bps, live)
+                    o.est_cost_bps = self.costs.round_trip_bps("crypto", o.spread_bps)
+                o.signal = o.signal and o.stop < o.price and o.spread_bps <= self.limits.max_spread_bps
+            self.feed_books(opps, now, "crypto")
+        self.db.kv_set("crypto_scan", {"at": now.isoformat(), "bar": str(boundary), "pairs": len(syms),
+                                       "scanned": scanned, "evaluated": evaluated,
+                                       "signals": [{"strategy": o.strategy, "symbol": o.symbol, "price": o.price,
+                                                    "stop": o.stop, "spread_bps": round(o.spread_bps, 1),
+                                                    "taken": bool(o.signal)} for o in opps],
+                                       "strategies": [r["strategy"] for r in strategies]})
+
+    def crypto_manage(self, now: dt.datetime) -> None:
+        """Stops/targets/trails for crypto books every cycle, around the clock."""
+        syms = sorted(s for s in self.books.symbols() if "/" in s)
+        if not syms:
+            return
+        self.refresh_quotes(syms)
+        bars = {s: {"atr": v["atr"]} for s, v in self.crypto_last.items()}
+        self.books.manage(self.prices, bars, now, False, self.spreads, crypto_only=True)
+
+    def upcoming_signals(self, today: dt.date) -> None:
+        """After the close: swing signals on TODAY's confirmed daily bar = entries planned for the next session."""
+        from .strategies.features import daily_panel
+        from .universe import DAILY_UNIVERSE
+        active, shadow = self.active_strategies("1Day")
+        wide = [u["symbol"] for u in self.universe
+                if u.get("adv") and not u.get("leveraged") and not is_leveraged_or_inverse(u["symbol"], u.get("name", ""))
+                and u["symbol"] not in DAILY_UNIVERSE][:self.s.swing_wide_n] if self.s.swing_wide_n > 0 else []
+        wide_set = set(wide)
+        raw = self.hist._fetch(list(DAILY_UNIVERSE) + wide, "1Day", today - dt.timedelta(days=560), today,
+                               "us_equity", "sip")
+        feats = daily_panel({k: v for k, v in raw.items() if len(v) > 210}, min_len=210)
+        feats = {k: f for k, f in feats.items()
+                 if k not in wide_set or (f["atr"].iloc[-1] / f["close"].iloc[-1] >= 0.005)}
+        out = []
+        for r in active + shadow + self._book_only.get("1Day", []):
+            inst = r["_inst"]
+            if "+" in r["strategy"] and r not in active:
+                continue
+            for sym, f in feats.items():
+                in_wide = sym in wide_set and r["strategy"].split("+")[0] in self.s.swing_wide_strategies
+                if inst.universe and sym not in inst.universe and not in_wide:
+                    continue
+                sig = inst.signals(f).iloc[-1]
+                if bool(sig["entry"]):
+                    out.append({"strategy": r["strategy"], "status": r["status"], "symbol": sym,
+                                "close": round(float(f["close"].iloc[-1]), 4), "stop": round(float(sig["stop"]), 4),
+                                "real_paper_order": r in active, "bar": str(f.index[-1].date())})
+        nxt = today + dt.timedelta(days=1)
+        while session(nxt) is None:
+            nxt += dt.timedelta(days=1)
+        self.db.kv_set("upcoming", {"as_of": today.isoformat(), "next_session": nxt.isoformat(), "signals": out})
 
     def analyze(self, now: dt.datetime) -> list[Opportunity]:
         """Stage 2 on confirmed bars. Returns scored + classified opportunities."""
@@ -608,6 +778,8 @@ class Engine:
 
     def feed_books(self, opps: list[Opportunity], now: dt.datetime, engine: str) -> None:
         """Every signal of every strategy goes to that strategy's own simulated $100 book (forward test)."""
+        bar_minutes = {"swing": 1440, "crypto": 60}.get(engine, BAR_MIN)
+        asset_class = "crypto" if engine == "crypto" else "us_equity"
         for o in opps:
             if not o.signal or "+" in o.strategy or not o.stop:
                 continue  # books track base strategies; regime-gated variants are research-only
@@ -615,7 +787,8 @@ class Engine:
             if cls is None:
                 continue
             try:
-                self.books.consider(o, cls().exit_plan(), engine, now, self.prices, BAR_MIN)
+                self.books.consider(o, cls().exit_plan(), engine, now, self.prices, bar_minutes,
+                                   asset_class=asset_class)
             except Exception:  # noqa: BLE001
                 log.exception("book entry failed for %s %s", o.strategy, o.symbol)
 
@@ -743,6 +916,11 @@ class Engine:
                 self.integrity[f"stale:{s}"] = "market data stale for a held position (possible halt)"
             else:
                 self.integrity.pop(f"stale:{s}", None)
+        try:
+            self.crypto_cycle(now)
+            self.crypto_manage(now)
+        except Exception:  # noqa: BLE001
+            log.exception("crypto cycle failed")
         if sess is None:
             self._equity_snapshot(now)
             self.publish_status(now)
@@ -789,7 +967,7 @@ class Engine:
         self.manage_shadow(now, flatten)
         if open_ <= now <= close_:
             try:
-                self.books.manage(self.prices, self.last_closed_bar, now, flatten, self.spreads)
+                self.books.manage(self.prices, self.last_closed_bar, now, flatten, self.spreads, stocks_only=True)
             except Exception:  # noqa: BLE001
                 log.exception("book management failed")
         for k in list(self.last_closed_bar):

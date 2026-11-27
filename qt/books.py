@@ -129,28 +129,29 @@ class Books:
         return s, led, st
 
     # ------------------------------------------------------------ entries
-    def consider(self, o, exit_plan, engine: str, now: dt.datetime, prices: dict, bar_minutes: int = 5) -> str | None:
+    def consider(self, o, exit_plan, engine: str, now: dt.datetime, prices: dict, bar_minutes: int = 5,
+                 asset_class: str = "us_equity") -> str | None:
         """Simulated entry for one signal. Returns the trade id, or None with the reason logged."""
         if not (o.signal and o.stop and o.price and o.stop < o.price):
             return None
         if any(t["symbol"] == o.symbol for t in self.open_trades(o.strategy)):
             return None
         s, led, st = self.account_state(o.strategy, now, prices)
-        prop = Proposal(o.symbol, "us_equity", o.strategy, o.price, o.stop, o.est_cost_bps, o.spread_bps,
+        prop = Proposal(o.symbol, asset_class, o.strategy, o.price, o.stop, o.est_cost_bps, o.spread_bps,
                         o.data_age_s, o.atr or 0.0, getattr(o, "max_corr", 0.0) or 0.0, None)
         d = self.guardian.evaluate(prop, s)
         if not d.approved:
             return None
-        spread = self.costs.spread_bps("us_equity", getattr(o, "adv", None), o.symbol)
-        fill = self.costs.buy_price(o.price, "us_equity", spread)
+        spread = self.costs.spread_bps(asset_class, getattr(o, "adv", None), o.symbol)
+        fill = self.costs.buy_price(o.price, asset_class, spread)
         notional = min(d.notional, led.buying_power() * 0.999)
         if notional < self.limits.min_order_notional:
             return None
         qty = notional / fill
-        fee = self.costs.fee("buy", qty, notional, "us_equity")
+        fee = self.costs.fee("buy", qty, notional, asset_class)
         tid = f"bk-{now.strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6]}"
         try:
-            led.apply_buy_fill(o.symbol, qty, fill, fee, now, o.strategy, tid)
+            led.apply_buy_fill(o.symbol, qty, fill, fee, now, o.strategy, tid, asset_class=asset_class)
         except LedgerViolation as e:
             log.info("book %s: %s", o.strategy, e)
             return None
@@ -169,8 +170,11 @@ class Books:
     # ------------------------------------------------------------ exits
     def _close(self, t: dict, ref_px: float, reason: str, now: dt.datetime, prices: dict, spread_bps: float = 5.0):
         s, led, st = self.account_state(t["strategy"], now, prices)
-        px = self.costs.sell_price(ref_px, "us_equity", spread_bps)
-        fee = self.costs.fee("sell", t["qty"], t["qty"] * px, "us_equity")
+        ac = "crypto" if "/" in t["symbol"] else "us_equity"
+        if ac == "crypto":
+            spread_bps = max(self.costs.spread_bps("crypto", None, t["symbol"]), spread_bps or 0.0)
+        px = self.costs.sell_price(ref_px, ac, spread_bps)
+        fee = self.costs.fee("sell", t["qty"], t["qty"] * px, ac)
         pos = led.positions.get(t["symbol"])
         if pos is None:
             self.db.execute("UPDATE book_trades SET status='closed', exit_reason='missing_position', exit_time=? "
@@ -190,10 +194,14 @@ class Books:
                         "exit_reason=? WHERE trade_id=?",
                         (now.isoformat(), px, pnl, pnl / risk, fee, reason, t["trade_id"]))
 
-    def manage(self, prices: dict, bars: dict, now: dt.datetime, flatten: bool, spreads: dict | None = None) -> None:
-        """Every engine cycle while the market is open: stops, targets, trailing, breakeven, intraday exits."""
+    def manage(self, prices: dict, bars: dict, now: dt.datetime, flatten: bool, spreads: dict | None = None,
+               crypto_only: bool = False, stocks_only: bool = False) -> None:
+        """Every engine cycle: stops, targets, trailing, breakeven, intraday/hourly exits. Stocks only while the
+        market is open (crypto_only=True outside it); crypto 24/7."""
         spreads = spreads or {}
         for t in self.open_trades():
+            if (crypto_only and "/" not in t["symbol"]) or (stocks_only and "/" in t["symbol"]):
+                continue
             px = prices.get(t["symbol"])
             if not px:
                 continue
@@ -209,26 +217,33 @@ class Books:
             if t["flatten_eod"] and flatten:
                 self._close(t, px, "eod_flatten", now, prices, sp)
                 continue
-            if t["flatten_eod"] and t["max_bars"]:
+            if t["max_bars"] and (t["bar_minutes"] or 5) < 1440:
                 held = (now - dt.datetime.fromisoformat(t["entry_time"])).total_seconds() / 60
                 if held >= t["max_bars"] * (t["bar_minutes"] or 5):
                     self._close(t, px, "time_exit", now, prices, sp)
                     continue
             new = stop
             b = bars.get(t["symbol"]) or {}
-            atr = b.get("atr") if t["flatten_eod"] else None  # swing trails use daily ATR, set in daily_update
+            atr = b.get("atr") if (t["bar_minutes"] or 5) < 1440 else None  # swing trails: daily ATR in daily_update
             if t["breakeven_r"] and px - t["entry_price"] >= t["breakeven_r"] * R:
                 new = max(new, t["entry_price"])
-            if t["flatten_eod"] and t["trail_atr"] and atr and px - t["entry_price"] >= t["trail_activate_r"] * R:
+            if t["trail_atr"] and atr and px - t["entry_price"] >= t["trail_activate_r"] * R:
                 new = max(new, px - t["trail_atr"] * atr)
             if new > stop + 1e-9:
                 self.db.execute("UPDATE book_trades SET stop=? WHERE trade_id=?", (new, t["trade_id"]))
+
+    def signal_exit(self, strategy: str, symbol: str, now: dt.datetime, prices: dict,
+                    spread_bps: float | None = None) -> None:
+        """The strategy's own exit signal fired on a confirmed bar (hourly crypto)."""
+        for t in self.open_trades(strategy):
+            if t["symbol"] == symbol and prices.get(symbol):
+                self._close(t, prices[symbol], "thesis_invalidated", now, prices, min(spread_bps or 5.0, 50.0))
 
     def daily_update(self, strategy: str, symbol: str, close: float, atr: float, exit_sig: bool, held_days: int,
                      now: dt.datetime, prices: dict) -> None:
         """Once per session for swing books, on the confirmed daily bar (same rules as the live swing path)."""
         for t in self.open_trades(strategy):
-            if t["symbol"] != symbol or t["flatten_eod"]:
+            if t["symbol"] != symbol or (t["bar_minutes"] or 5) < 1440:
                 continue
             px = prices.get(symbol) or close
             if exit_sig:
