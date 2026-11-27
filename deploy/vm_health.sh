@@ -27,6 +27,18 @@ for r in c.execute("SELECT component, ts, status FROM heartbeats"):
     print("hb", *r)
 for r in c.execute("SELECT ts, level, kind, substr(message, 1, 200) FROM events ORDER BY rowid DESC LIMIT 20"):
     print("ev", *r)
+for k in ("daily_cycle_done", "universe_date"):
+    r = c.execute("SELECT v FROM kv WHERE k=?", (k,)).fetchone()
+    print("kv", k, r[0] if r else None)
+for r in c.execute("SELECT strategy, status, COUNT(*) FROM opportunities WHERE ts >= date('now') "
+                   "GROUP BY strategy, status ORDER BY 3 DESC LIMIT 15"):
+    print("opp", *r)
+for r in c.execute("SELECT ts, symbol, strategy, status, round(score,1), substr(reason, 1, 160) FROM opportunities "
+                   "WHERE ts >= date('now') AND status != 'REJECT' ORDER BY score DESC LIMIT 8"):
+    print("top", *r)
+for r in c.execute("SELECT symbol, strategy, status, notional, entry_price, stop_price FROM trades "
+                   "WHERE status IN ('open', 'pending') OR session >= date('now')"):
+    print("trade", *r)
 PY
   echo "--- container resources"
   docker stats --no-stream --format '{{.Name}} cpu={{.CPUPerc}} mem={{.MemUsage}}'
