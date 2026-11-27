@@ -54,17 +54,18 @@ step "bucket gs://$BUCKET"
 $G storage buckets describe "gs://$BUCKET" >/dev/null 2>&1 || \
   $G storage buckets create "gs://$BUCKET" --location="$REGION" --default-storage-class=STANDARD \
      --uniform-bucket-level-access --public-access-prevention
-$G storage buckets add-iam-policy-binding "gs://$BUCKET" --member="serviceAccount:$SA" \
+retry() { for i in 1 2 3 4 5 6; do "$@" && return 0; sleep $((i * 5)); done; return 1; }  # new SAs take a moment to propagate
+retry $G storage buckets add-iam-policy-binding "gs://$BUCKET" --member="serviceAccount:$SA" \
   --role=roles/storage.objectAdmin >/dev/null
 
 step "secret qt-env"
 $G secrets describe qt-env >/dev/null 2>&1 || $G secrets create qt-env --replication-policy=automatic >/dev/null
 $G secrets versions add qt-env --data-file="$ENV_FILE" >/dev/null
 # keep only the newest version (free tier: 6 active versions)
-for v in $($G secrets versions list qt-env --filter="state=ENABLED" --sort-by=~createTime --format="value(name)" | tail -n +2); do
+for v in $($G secrets versions list qt-env --filter="state=ENABLED" --sort-by=~createTime --format="value(name.basename())" | tail -n +2); do
   $G secrets versions destroy "$v" --secret=qt-env >/dev/null
 done
-$G secrets add-iam-policy-binding qt-env --member="serviceAccount:$SA" \
+retry $G secrets add-iam-policy-binding qt-env --member="serviceAccount:$SA" \
   --role=roles/secretmanager.secretAccessor >/dev/null
 
 step "release bundle"
