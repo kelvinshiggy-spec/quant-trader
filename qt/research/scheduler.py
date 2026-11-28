@@ -12,6 +12,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -74,7 +75,19 @@ def main():
                 db.heartbeat("research", "running")
                 db.kv_set("research_requested", None)
                 t0 = time.time()
-                summ = run(workers=workers, symbols=symbols, end=today - dt.timedelta(days=1))
+                # a run takes hours on the small server: keep beating so the health check (6 h limit for a
+                # running job) does not restart it mid-run; a run past 20 h stops beating and is restarted
+                done = threading.Event()
+
+                def beat():
+                    while not done.wait(300):
+                        if time.time() - t0 < 20 * 3600:
+                            db.heartbeat("research", "running", {"elapsed_min": round((time.time() - t0) / 60)})
+                threading.Thread(target=beat, name="research-heartbeat", daemon=True).start()
+                try:
+                    summ = run(workers=workers, symbols=symbols, end=today - dt.timedelta(days=1))
+                finally:
+                    done.set()
                 update_forward_metrics(db)
                 db.kv_set("research_last_day", today.isoformat())
                 db.event("info", "research", f"research run {summ['run_id']} finished in {time.time() - t0:.0f}s; "

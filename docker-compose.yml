@@ -39,7 +39,8 @@ services:
 
   research:
     <<: *common
-    command: ["python", "-m", "qt.research.scheduler"]
+    # lowest CPU priority: research must never starve the trading engine or the dashboard on the small server
+    command: ["nice", "-n", "15", "python", "-m", "qt.research.scheduler"]
     environment:
       RESEARCH_WORKERS: "${RESEARCH_WORKERS:-1}"
     mem_limit: "${RESEARCH_MEM_LIMIT:-900m}"
