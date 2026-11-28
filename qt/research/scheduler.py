@@ -66,7 +66,10 @@ def main():
             sess = session(today)
             last = db.kv_get("research_last_day", "")
             req = db.kv_get("research_requested")
-            due_nightly = sess is not None and now > sess[1] + dt.timedelta(minutes=60) and last != today.isoformat()
+            # WEEKLY on a non-trading day (2026-11-28): a full run takes 15+ hours on the small server and starved
+            # the engine and dashboard of CPU when it ran nightly. The forward books select strategies daily.
+            last_d = dt.date.fromisoformat(last) if last else dt.date(2000, 1, 1)
+            due_nightly = sess is None and (today - last_d).days >= 6
             if db.kv_get("backup_last_day", "") != today.isoformat() and (sess is None or now > sess[1]):
                 p = backup(db, s.data_dir)
                 db.kv_set("backup_last_day", today.isoformat())
@@ -76,12 +79,12 @@ def main():
                 db.kv_set("research_requested", None)
                 t0 = time.time()
                 # a run takes hours on the small server: keep beating so the health check (6 h limit for a
-                # running job) does not restart it mid-run; a run past 20 h stops beating and is restarted
+                # running job) does not restart it mid-run; a run past 48 h stops beating and is restarted
                 done = threading.Event()
 
                 def beat():
                     while not done.wait(300):
-                        if time.time() - t0 < 20 * 3600:
+                        if time.time() - t0 < 48 * 3600:
                             db.heartbeat("research", "running", {"elapsed_min": round((time.time() - t0) / 60)})
                 threading.Thread(target=beat, name="research-heartbeat", daemon=True).start()
                 try:
